@@ -1,4 +1,13 @@
-import json
+try:
+    import orjson
+    def _dumps(obj):
+        return orjson.dumps(obj).decode("utf-8")
+except ImportError:
+    import json
+    def _dumps(obj):
+        return json.dumps(obj, ensure_ascii=False)
+
+import json  # keep for json.load/json.dumps in non-hot paths
 import random
 import re
 import time
@@ -294,13 +303,18 @@ origin_tracker = OriginReqTracker()
 # CF Latency Sampler: native thread (outside gevent) for accurate latency
 # ---------------------------------------------------------------------------
 class CFLatencySampler:
-    """Periodically sample CF response time from a native thread (no gevent overhead)."""
+    """Periodically sample CF response time from a native thread (no gevent overhead).
+    Uses exponential moving average to smooth out spikes.
+    """
 
-    def __init__(self, interval=5.0):
+    def __init__(self, interval=5.0, alpha=0.3):
         self._interval = interval
+        self._alpha = alpha  # EMA smoothing factor (0.3 = recent 30% + history 70%)
         self._lock = threading.Lock()
         self._hit_ms = 0.0
         self._miss_ms = 0.0
+        self._hit_raw = 0.0   # latest raw sample
+        self._miss_raw = 0.0
         self._running = False
         self._thread = None
 
@@ -315,6 +329,12 @@ class CFLatencySampler:
     def stop(self):
         self._running = False
 
+    def _ema(self, old, new):
+        """Exponential moving average."""
+        if old == 0:
+            return new
+        return round(old * (1 - self._alpha) + new * self._alpha, 1)
+
     def _run(self):
         import requests as _req
         import time as _t
@@ -325,30 +345,42 @@ class CFLatencySampler:
                 r1 = _req.get(hit_url, timeout=10)
                 ms1 = round(r1.elapsed.total_seconds() * 1000, 1)
                 x1 = (r1.headers.get("x-cache") or "").lower()
+
                 # MISS sample: live URL (max-age=1)
                 miss_url = f"{self._base_url}/playlist_3.m3u8"
                 r2 = _req.get(miss_url, timeout=10)
                 ms2 = round(r2.elapsed.total_seconds() * 1000, 1)
                 x2 = (r2.headers.get("x-cache") or "").lower()
+
                 with self._lock:
                     if "hit" in x1:
-                        self._hit_ms = ms1
+                        self._hit_raw = ms1
+                        self._hit_ms = self._ema(self._hit_ms, ms1)
                     if "hit" not in x2:
-                        self._miss_ms = ms2
+                        self._miss_raw = ms2
+                        self._miss_ms = self._ema(self._miss_ms, ms2)
                     elif "hit" not in x1:
-                        self._miss_ms = ms1
+                        self._miss_raw = ms1
+                        self._miss_ms = self._ema(self._miss_ms, ms1)
             except Exception:
                 pass
             _t.sleep(self._interval)
 
     def get(self):
         with self._lock:
-            return {"hit_ms": self._hit_ms, "miss_ms": self._miss_ms}
+            return {
+                "hit_ms": self._hit_ms,
+                "miss_ms": self._miss_ms,
+                "hit_raw": self._hit_raw,
+                "miss_raw": self._miss_raw,
+            }
 
     def reset(self):
         with self._lock:
             self._hit_ms = 0.0
             self._miss_ms = 0.0
+            self._hit_raw = 0.0
+            self._miss_raw = 0.0
 
 cf_sampler = CFLatencySampler(interval=5.0)
 
@@ -945,6 +977,8 @@ class LiveUser(FastHttpUser):
     concurrency = 10                # connection pool size per user
     max_retries = 0                 # 재시도 없음
     max_redirects = 0               # 리다이렉트 없음
+    connection_timeout = 30.0       # 연결 타임아웃 (기본 5s → 30s)
+    network_timeout = 30.0          # 읽기 타임아웃 (기본 5s → 30s)
     user_type = "live"
     time_delay = None
 
@@ -959,6 +993,8 @@ class TimeMachineUser(FastHttpUser):
     concurrency = 10                # connection pool size per user
     max_retries = 0                 # 재시도 없음
     max_redirects = 0               # 리다이렉트 없음
+    connection_timeout = 30.0       # 연결 타임아웃
+    network_timeout = 30.0          # 읽기 타임아웃
     user_type = "timemachine"
     time_delay = 1  # placeholder, randomized per request
 
@@ -1071,16 +1107,21 @@ def _evaluate_pass_fail():
     verdict = "PASS" if val >= c["pass"] else ("FAIL" if val < c["fail"] else "WARN")
     results.append({"id": "1-1", "label": c["label"], "value": f"{val}{c['unit']}", "pass": c["pass"], "fail": c["fail"], "verdict": verdict})
 
-    # HIT avg latency (use CF sampler for accurate value)
+    # HIT avg latency — use period_tracker (real request measurements) as primary,
+    # CF sampler as fallback (sampler is unreliable under high load)
     cf_lat = cf_sampler.get()
+    period_snap = _get_period_snapshot()
+    p_hit_actual = period_snap.get("hit_actual_ms", 0) if period_snap else 0
+    p_miss_actual = period_snap.get("miss_actual_ms", 0) if period_snap else 0
+
     c = criteria["hit_avg_latency"]
-    val = cf_lat["hit_ms"] if cf_lat["hit_ms"] > 0 else snap["hit"]["avg"]
+    val = p_hit_actual if p_hit_actual > 0 else (cf_lat["hit_ms"] if cf_lat["hit_ms"] > 0 else snap["hit"]["avg"])
     verdict = "PASS" if val <= c["pass"] else ("FAIL" if val > c["fail"] else "WARN")
     results.append({"id": "1-2", "label": c["label"], "value": f"{val}{c['unit']}", "pass": f"<={c['pass']}", "fail": f">{c['fail']}", "verdict": verdict})
 
-    # MISS avg latency (use CF sampler for accurate value)
+    # MISS avg latency
     c = criteria["miss_avg_latency"]
-    val = cf_lat["miss_ms"] if cf_lat["miss_ms"] > 0 else snap["miss"]["avg"]
+    val = p_miss_actual if p_miss_actual > 0 else (cf_lat["miss_ms"] if cf_lat["miss_ms"] > 0 else snap["miss"]["avg"])
     verdict = "PASS" if val <= c["pass"] else ("FAIL" if val > c["fail"] else "WARN")
     results.append({"id": "1-3", "label": c["label"], "value": f"{val}{c['unit']}", "pass": f"<={c['pass']}", "fail": f">{c['fail']}", "verdict": verdict})
 
@@ -1355,7 +1396,7 @@ function load(){
     .then(r=>r.json()).then(d=>{
       totalPages=d.total_pages;page=d.page;
       pageInfo.textContent='Page '+d.page+' / '+d.total_pages;
-      totalInfo.textContent=d.total+' requests';
+      totalInfo.textContent=d.total.toLocaleString()+' requests';
       prevBtn.disabled=page<=1;nextBtn.disabled=page>=totalPages;
       lastData=d.entries;
       renderRows(sortData(lastData));
@@ -1655,7 +1696,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="chart-full"><button class="dl-btn" onclick="downloadChartPng('c1','전체RPS')">PNG</button><h3>1. 전체 RPS <small style="font-weight:400;color:#94a3b8">— 초당 처리 요청수. 실측 vs 목표(CCU÷사이클) 비교</small> <span id="c1info" style="font-size:.75rem;font-weight:400"></span></h3><div style="height:200px"><canvas id="c1"></canvas></div></div>
   <div class="chart-grid">
     <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c2','히트율')">PNG</button><h3>2. 캐시 히트율 / 미스율 <small style="font-weight:400;color:#94a3b8">— CF 캐시 효율. 95%↑ PASS, 80%↓ FAIL</small></h3><div style="height:200px"><canvas id="c2"></canvas></div></div>
-    <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c3','호출수')">PNG</button><h3>3. 구간별 호출수 <small style="font-weight:400;color:#94a3b8">— 각 시간대의 HIT/MISS 실제 호출 건수</small></h3><div style="height:200px"><canvas id="c3"></canvas></div></div>
+    <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c3','호출수')">PNG</button><h3>3. 구간별 호출수 <small style="font-weight:400;color:#94a3b8">— CF MISS + 오리진 도달 호출 건수. MISS와 오리진이 비례하면 캐시 미스가 곧 오리진 부하</small></h3><div style="height:200px"><canvas id="c3"></canvas></div></div>
     <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c4','응답속도')">PNG</button><h3>4. HIT / MISS 응답속도 <small style="font-weight:400;color:#94a3b8">— HIT≤100ms PASS, MISS≤500ms PASS</small></h3><div style="height:200px"><canvas id="c4"></canvas></div></div>
     <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c5','에러율')">PNG</button><h3>5. 에러율 <small style="font-weight:400;color:#94a3b8">— 0.1%↓ PASS, 1%↑ FAIL. 4xx/5xx 모니터링</small></h3><div style="height:200px"><canvas id="c5"></canvas></div></div>
   </div>
@@ -1762,7 +1803,7 @@ function renderLiveBar(rt){
   h+='<span class="lb-sep"></span>';
   // Mbps removed — playlist-only traffic is misleading
   h+='</div>';
-  h+='<div class="lb-detail">RPS 상세: <b>'+rt.total_requests+'</b>건 / <b>'+rt.interval_sec+'</b>초 = <b>'+rt.rps+'/s</b> &nbsp;( HIT <b>'+rt.hits+'</b>건 = <b>'+rt.hit_rps+'/s</b> + MISS <b>'+rt.misses+'</b>건 = <b>'+rt.miss_rps+'/s</b>';
+  h+='<div class="lb-detail">RPS 상세: <b>'+(rt.total_requests||0).toLocaleString()+'</b>건 / <b>'+rt.interval_sec+'</b>초 = <b>'+(rt.rps||0).toLocaleString()+'/s</b> &nbsp;( HIT <b>'+(rt.hits||0).toLocaleString()+'</b>건 = <b>'+(rt.hit_rps||0).toLocaleString()+'/s</b> + MISS <b>'+(rt.misses||0).toLocaleString()+'</b>건 = <b>'+(rt.miss_rps||0).toLocaleString()+'/s</b>';
   if(rt.errors>0)h+=' + 에러 <b>'+rt.errors+'</b>건';
   h+=' ) &nbsp;│&nbsp; 목표 RPS 계산: <b>'+(rt.user_count||0)+'</b>명 ÷ <b>'+(rt.avg_cycle_sec||'?')+'</b>초(사이클) = <b>'+rt.target_rps+'/s</b></div>';
   el.innerHTML=h;
@@ -1784,10 +1825,10 @@ function refresh(){
     document.querySelectorAll('.phase-bar .pb').forEach(b=>b.classList.toggle('active',b.textContent.includes(wc.phase||'---')));
     // Top cards
     var cards='';
-    cards+='<div class="card"><div class="label">히트율</div><div class="value rate '+rc(o.hit_rate)+'">'+o.hit_rate+'%</div><div class="sub">'+o.hits+' / '+o.total+'</div></div>';
+    cards+='<div class="card"><div class="label">히트율</div><div class="value rate '+rc(o.hit_rate)+'">'+o.hit_rate+'%</div><div class="sub">'+(o.hits||0).toLocaleString()+' / '+(o.total||0).toLocaleString()+'</div></div>';
     var cfA=rt&&rt.cf_actual?rt.cf_actual:{};var cfH=cfA.hit_ms||'-';var cfM=cfA.miss_ms||'-';
     cards+='<div class="card"><div class="label">응답속도</div><div class="value" style="font-size:1.1rem"><span class="hit">'+cfH+'</span> / <span class="miss">'+cfM+'</span></div><div class="sub">CF실제 HIT / MISS ms</div></div>';
-    cards+='<div class="card"><div class="label">총 요청수</div><div class="value" style="font-size:1.2rem">'+o.total+'</div><div class="sub">평균 수명: '+o.avg_age+'초 | POP: '+o.top_pop+'</div></div>';
+    cards+='<div class="card"><div class="label">총 요청수</div><div class="value" style="font-size:1.2rem">'+(o.total||0).toLocaleString()+'</div><div class="sub">평균 수명: '+o.avg_age+'초 | POP: '+o.top_pop+'</div></div>';
     cards+='<div class="card"><div class="label">오리진 / 에러</div><div class="value" style="font-size:1.1rem"><span style="color:'+(origin.current_origin_rps<5?'#4ade80':'#f87171')+'">'+origin.current_origin_rps+'/s</span> <span style="color:'+(lat.error_rate<0.1?'#4ade80':'#f87171')+'">'+lat.error_rate+'%</span></div><div class="sub">오리진 요청/초 | 에러율</div></div>';
     document.getElementById('topCards').innerHTML=cards;
 
@@ -1815,10 +1856,10 @@ function refresh(){
         {label:'목표 95%',data:mts.map(()=>95),borderColor:'#facc15',borderDash:[6,3],borderWidth:1,pointRadius:0,yAxisID:'y'}
       ]},options:{scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',min:0,max:100,title:{display:true,text:'히트율 %',color:'#4ade80'}},y1:{...chartDarkTheme,position:'right',min:0,title:{display:true,text:'미스율 %',color:'#f87171'},grid:{drawOnChartArea:false}}}}});
       var fmtNum=function(v){return v.toLocaleString();};
-      makeChart('c3',{type:'bar',data:{labels:tsL,datasets:[
-        {label:'CF MISS 호출수',data:mts.map(p=>p.miss_count||0),backgroundColor:'rgba(251,146,60,0.6)',borderColor:'#fb923c',borderWidth:1,yAxisID:'y'},
-        {label:'CF HIT 호출수',data:mts.map(p=>p.hit_count||0),backgroundColor:'rgba(74,222,128,0.3)',borderColor:'#4ade80',borderWidth:1,yAxisID:'y1'}
-      ]},options:{plugins:{tooltip:{callbacks:{label:function(ctx){return ctx.dataset.label+': '+ctx.parsed.y.toLocaleString()+'건';}}},legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}}},scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',beginAtZero:true,title:{display:true,text:'MISS 호출수 (건)',color:'#fb923c'},ticks:{callback:fmtNum}},y1:{...chartDarkTheme,position:'right',beginAtZero:true,title:{display:true,text:'HIT 호출수 (건)',color:'#4ade80'},ticks:{callback:fmtNum},grid:{drawOnChartArea:false}}}}});
+      makeChart('c3',{type:'line',data:{labels:tsL,datasets:[
+        {label:'CF MISS 호출수',data:mts.map(p=>p.miss_count||0),borderColor:'#fb923c',backgroundColor:'rgba(251,146,60,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
+        {label:'오리진 도달 호출수',data:mts.map(p=>Math.round(p.origin_rps||0)),borderColor:'#f87171',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0.3,yAxisID:'y1'}
+      ]},options:{plugins:{tooltip:{callbacks:{label:function(ctx){return ctx.dataset.label+': '+ctx.parsed.y.toLocaleString()+'건';}}},legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}}},scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',beginAtZero:true,title:{display:true,text:'CF MISS 호출수 (건)',color:'#fb923c'},ticks:{callback:fmtNum}},y1:{...chartDarkTheme,position:'right',beginAtZero:true,title:{display:true,text:'오리진 도달 호출수 (건)',color:'#f87171'},ticks:{callback:fmtNum},grid:{drawOnChartArea:false}}}}});
       makeChart('c4',{type:'line',data:{labels:tsL,datasets:[
         {label:'CF HIT',data:mts.map(p=>p.cf_hit_ms||0),borderColor:'#4ade80',borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
         {label:'CF MISS',data:mts.map(p=>p.cf_miss_ms||0),borderColor:'#f87171',borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y1'},
@@ -1853,17 +1894,17 @@ function refresh(){
     var bk='';
     if(lat.by_codec&&Object.keys(lat.by_codec).length){
       bk+='<div class="section"><h2>코덱별</h2><table><tr><th>코덱</th><th>총건수</th><th>히트율</th><th>HIT 평균</th><th>MISS 평균</th></tr>';
-      for(var c in lat.by_codec){var d=lat.by_codec[c];bk+='<tr><td><b>'+c+'</b></td><td>'+d.total+'</td><td class="rate '+rc(d.hit_rate)+'">'+d.hit_rate+'%</td><td>'+d.hit.avg+' ms</td><td>'+d.miss.avg+' ms</td></tr>';}
+      for(var c in lat.by_codec){var d=lat.by_codec[c];bk+='<tr><td><b>'+c+'</b></td><td>'+d.total.toLocaleString()+'</td><td class="rate '+rc(d.hit_rate)+'">'+d.hit_rate+'%</td><td>'+d.hit.avg+' ms</td><td>'+d.miss.avg+' ms</td></tr>';}
       bk+='</table></div>';
     }
     if(lat.by_rendition&&Object.keys(lat.by_rendition).length){
       bk+='<div class="section"><h2>렌디션별</h2><table><tr><th>렌디션</th><th>총건수</th><th>히트율</th><th>HIT 평균</th><th>MISS 평균</th></tr>';
-      for(var r in lat.by_rendition){var d=lat.by_rendition[r];bk+='<tr><td><b>'+r+'</b></td><td>'+d.total+'</td><td class="rate '+rc(d.hit_rate)+'">'+d.hit_rate+'%</td><td>'+d.hit.avg+' ms</td><td>'+d.miss.avg+' ms</td></tr>';}
+      for(var r in lat.by_rendition){var d=lat.by_rendition[r];bk+='<tr><td><b>'+r+'</b></td><td>'+d.total.toLocaleString()+'</td><td class="rate '+rc(d.hit_rate)+'">'+d.hit_rate+'%</td><td>'+d.hit.avg+' ms</td><td>'+d.miss.avg+' ms</td></tr>';}
       bk+='</table></div>';
     }
     if(cache.by_user_type&&cache.by_user_type.length){
       bk+='<div class="section"><h2>사용자유형별</h2><table><tr><th>유형</th><th>총건수</th><th>히트</th><th>미스</th><th>히트율</th><th>평균 수명</th></tr>';
-      cache.by_user_type.forEach(r=>{bk+='<tr><td><b>'+r.user_type+'</b></td><td>'+r.total+'</td><td class="hit">'+r.hits+'</td><td class="miss">'+r.misses+'</td><td class="rate '+rc(r.hit_rate)+'">'+r.hit_rate+'%</td><td>'+r.avg_age+'s</td></tr>';});
+      cache.by_user_type.forEach(r=>{bk+='<tr><td><b>'+r.user_type+'</b></td><td>'+r.total.toLocaleString()+'</td><td class="hit">'+r.hits.toLocaleString()+'</td><td class="miss">'+r.misses.toLocaleString()+'</td><td class="rate '+rc(r.hit_rate)+'">'+r.hit_rate+'%</td><td>'+r.avg_age+'s</td></tr>';});
       bk+='</table></div>';
     }
     if(!bk)bk='<div class="no-data">데이터 없음</div>';
@@ -1937,7 +1978,7 @@ def on_init(environment, **kwargs):
                     {"key": "cache-statistics", "data": _get_cache_table_data()},
                     {"key": "request-urls", "data": url_data},
                 ]
-                response.set_data(json.dumps(data))
+                response.set_data(_dumps(data))
             except Exception:
                 pass
             return response
@@ -1968,7 +2009,7 @@ def on_init(environment, **kwargs):
 
     @environment.web_ui.app.route("/cache-stats")
     def cache_stats_api():
-        return Response(json.dumps(_get_collector_snapshot()), mimetype="application/json")
+        return Response(_dumps(_get_collector_snapshot()), mimetype="application/json")
 
     @environment.web_ui.app.route("/cache-dashboard")
     def cache_dashboard():
@@ -1978,24 +2019,24 @@ def on_init(environment, **kwargs):
     def throughput_api():
         mbps = throughput.get_throughput_mbps()
         total_bytes = throughput.get_total_bytes()
-        return Response(json.dumps({"mbps": mbps, "total_bytes": total_bytes, "total_formatted": _format_bytes(total_bytes)}), mimetype="application/json")
+        return Response(_dumps({"mbps": mbps, "total_bytes": total_bytes, "total_formatted": _format_bytes(total_bytes)}), mimetype="application/json")
 
     @environment.web_ui.app.route("/latency-stats")
     def latency_stats_api():
-        return Response(json.dumps(_get_resp_snapshot()), mimetype="application/json")
+        return Response(_dumps(_get_resp_snapshot()), mimetype="application/json")
 
     @environment.web_ui.app.route("/pass-fail")
     def pass_fail_api():
-        return Response(json.dumps(_evaluate_pass_fail()), mimetype="application/json")
+        return Response(_dumps(_evaluate_pass_fail()), mimetype="application/json")
 
     @environment.web_ui.app.route("/origin-rps")
     def origin_rps_api():
-        return Response(json.dumps(_get_origin_snapshot()), mimetype="application/json")
+        return Response(_dumps(_get_origin_snapshot()), mimetype="application/json")
 
     @environment.web_ui.app.route("/metrics-ts")
     def metrics_ts_api():
         last_n = int(flask_request.args.get("n", 120))
-        return Response(json.dumps(metrics_ts.get(last_n)), mimetype="application/json")
+        return Response(_dumps(metrics_ts.get(last_n)), mimetype="application/json")
 
     @environment.web_ui.app.route("/realtime-stats")
     def realtime_stats_api():
@@ -2008,7 +2049,7 @@ def on_init(environment, **kwargs):
             data["target_rps"] = round(user_count / avg_cycle, 1) if avg_cycle > 0 else 0
             data["avg_cycle_sec"] = round(avg_cycle, 1)
             data["cf_actual"] = cf_sampler.get()
-        return Response(json.dumps(data), mimetype="application/json")
+        return Response(_dumps(data), mimetype="application/json")
 
     @environment.web_ui.app.route("/request-log")
     def request_log_api():
@@ -2027,7 +2068,7 @@ def on_init(environment, **kwargs):
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = max(1, min(page, total_pages))
         start = (page - 1) * per_page
-        return Response(json.dumps({"entries": all_entries[start:start + per_page], "page": page, "per_page": per_page, "total": total, "total_pages": total_pages}), mimetype="application/json")
+        return Response(_dumps({"entries": all_entries[start:start + per_page], "page": page, "per_page": per_page, "total": total, "total_pages": total_pages}), mimetype="application/json")
 
     @environment.web_ui.app.route("/request-log-export")
     def request_log_export():
@@ -2060,7 +2101,7 @@ def on_init(environment, **kwargs):
     @environment.web_ui.app.route("/weight-config", methods=["GET", "POST"])
     def weight_config():
         if flask_request.method == "GET":
-            return Response(json.dumps({
+            return Response(_dumps({
                 "live_weight": LiveUser.weight, "timemachine_weight": TimeMachineUser.weight,
                 "phase": current_phase["name"],
                 "time_delay_min": config.TIME_DELAY_MIN,
@@ -2095,7 +2136,7 @@ def on_init(environment, **kwargs):
             else:
                 current_phase["name"] = "-"
 
-        return Response(json.dumps({
+        return Response(_dumps({
             "live_weight": live_w, "timemachine_weight": tm_w,
             "phase": current_phase["name"],
             "time_delay_min": config.TIME_DELAY_MIN,
@@ -2107,9 +2148,9 @@ def on_init(environment, **kwargs):
         import os
         results_dir = os.path.join(os.path.dirname(__file__) or ".", "results")
         if not os.path.isdir(results_dir):
-            return Response(json.dumps([]), mimetype="application/json")
+            return Response(_dumps([]), mimetype="application/json")
         files = sorted([f for f in os.listdir(results_dir) if f.endswith(".json")], reverse=True)
-        return Response(json.dumps(files), mimetype="application/json")
+        return Response(_dumps(files), mimetype="application/json")
 
     @environment.web_ui.app.route("/results/<filename>")
     def results_download(filename):
@@ -2141,7 +2182,7 @@ def on_init(environment, **kwargs):
             if run_time < elapsed:
                 current_stage = {"index": i + 1, **stage, "elapsed": round(run_time), "stage_remaining": round(elapsed - run_time)}
                 break
-        return Response(json.dumps({
+        return Response(_dumps({
             "enabled": config.USE_LOAD_SHAPE,
             "user_count": user_count,
             "run_time": round(run_time),
