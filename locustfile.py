@@ -2207,13 +2207,16 @@ def on_test_start(environment, **kwargs):
     _tm_base_time = now
     current_phase["test_start_time"] = time.strftime("%Y%m%d_%H%M%S")
     cf_sampler.reset()
-    cf_sampler.start(config.BASE_URL)
+    # Go sampler는 master에서만 시작 (worker에서 중복 실행 방지)
+    if _is_master() or not _global_environment:
+        cf_sampler.start(config.BASE_URL)
     gevent.spawn(cache_reporter, environment)
 
 
 @events.test_stop.add_listener
 def on_test_stop(environment, **kwargs):
     """Auto-save test results as JSON snapshot on test stop."""
+    cf_sampler.stop()
     import os
     ts = current_phase.get("test_start_time", time.strftime("%Y%m%d_%H%M%S"))
     phase = current_phase.get("name", "-")
