@@ -338,17 +338,19 @@ class CFLatencySampler:
     def _run(self):
         import requests as _req
         import time as _t
+        # Session keeps TCP+TLS alive — no reconnect overhead per sample
+        session = _req.Session()
         while self._running:
             try:
                 # HIT sample: TM URL (long cache TTL)
                 hit_url = f"{self._base_url}/playlist_3.m3u8?aws.manifestsettings=time_delay:3600"
-                r1 = _req.get(hit_url, timeout=10)
+                r1 = session.get(hit_url, timeout=10)
                 ms1 = round(r1.elapsed.total_seconds() * 1000, 1)
                 x1 = (r1.headers.get("x-cache") or "").lower()
 
                 # MISS sample: live URL (max-age=1)
                 miss_url = f"{self._base_url}/playlist_3.m3u8"
-                r2 = _req.get(miss_url, timeout=10)
+                r2 = session.get(miss_url, timeout=10)
                 ms2 = round(r2.elapsed.total_seconds() * 1000, 1)
                 x2 = (r2.headers.get("x-cache") or "").lower()
 
@@ -363,7 +365,12 @@ class CFLatencySampler:
                         self._miss_raw = ms1
                         self._miss_ms = self._ema(self._miss_ms, ms1)
             except Exception:
-                pass
+                # 연결 끊기면 세션 재생성
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = _req.Session()
             _t.sleep(self._interval)
 
     def get(self):
