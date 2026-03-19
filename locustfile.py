@@ -308,8 +308,8 @@ class CFLatencySampler:
     Filters out greenlet scheduling noise (>500ms) to show true CF response time.
     """
 
-    HIT_THRESHOLD_MS = 200   # HIT > 200ms = greenlet noise, discard
-    MISS_THRESHOLD_MS = 300  # MISS > 300ms = greenlet noise (origin roundtrip is ~100ms)
+    HIT_THRESHOLD_MS = 300   # HIT > 300ms = greenlet noise (real CF HIT ~4-50ms)
+    MISS_THRESHOLD_MS = 400  # MISS > 400ms = greenlet noise (real CF MISS ~30-100ms)
 
     def __init__(self, alpha=0.3):
         self._alpha = alpha
