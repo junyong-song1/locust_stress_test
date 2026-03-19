@@ -565,7 +565,7 @@ _worker_reset_ts = 0  # worker-side reset tracking
 @events.worker_report.add_listener
 def on_worker_report(client_id, data):
     """Master receives data from a worker and merges it."""
-    global _master_resp, _master_origin, _master_collector
+    global _master_resp, _master_collector
 
     # Ignore stale data from before last reset (5s tolerance for distributed event timing)
     worker_rts = data.get("custom_reset_ts", 0)
@@ -818,6 +818,7 @@ def _get_hdr(headers, key):
 
 # Request log sampling — only log every Nth request to reduce CPU
 _req_counter = 0
+_req_counter_lock = threading.Lock()
 LOG_SAMPLE_RATE = 10  # log 1 in 10 requests
 
 
@@ -904,8 +905,10 @@ def _watch_stream(user):
     })
 
     # --- Sampled: request_log + PDT (every Nth request) ---
-    _req_counter += 1
-    if _req_counter % LOG_SAMPLE_RATE == 0:
+    with _req_counter_lock:
+        _req_counter += 1
+        _should_log = (_req_counter % LOG_SAMPLE_RATE == 0)
+    if _should_log:
         age_str = _get_hdr(hdrs, "age") or "-"
         pop = _get_hdr(hdrs, "x-amz-cf-pop") or "-"
 
@@ -1063,13 +1066,13 @@ def on_request(name, response, exception, response_time, **kwargs):
 
 @events.reset_stats.add_listener
 def on_reset_stats():
-    global cache_stats, _master_cache_stats, _master_resp, _master_collector
+    global _master_resp, _master_collector
     global _master_reset_ts, _worker_reset_ts
     now = time.time()
     _master_reset_ts = now
     _worker_reset_ts = now  # Workers also get reset_stats event
-    cache_stats = {}
-    _master_cache_stats = {}
+    cache_stats.clear()
+    _master_cache_stats.clear()
     _master_resp = None
     _master_origin_by_worker.clear()
     _master_collector = None
@@ -1107,21 +1110,16 @@ def _evaluate_pass_fail():
     verdict = "PASS" if val >= c["pass"] else ("FAIL" if val < c["fail"] else "WARN")
     results.append({"id": "1-1", "label": c["label"], "value": f"{val}{c['unit']}", "pass": c["pass"], "fail": c["fail"], "verdict": verdict})
 
-    # HIT avg latency — use period_tracker (real request measurements) as primary,
-    # CF sampler as fallback (sampler is unreliable under high load)
+    # HIT avg latency — CF Sampler EMA (native thread, no greenlet overhead)
     cf_lat = cf_sampler.get()
-    period_snap = _get_period_snapshot()
-    p_hit_actual = period_snap.get("hit_actual_ms", 0) if period_snap else 0
-    p_miss_actual = period_snap.get("miss_actual_ms", 0) if period_snap else 0
-
     c = criteria["hit_avg_latency"]
-    val = p_hit_actual if p_hit_actual > 0 else (cf_lat["hit_ms"] if cf_lat["hit_ms"] > 0 else snap["hit"]["avg"])
+    val = cf_lat["hit_ms"] if cf_lat["hit_ms"] > 0 else snap["hit"]["avg"]
     verdict = "PASS" if val <= c["pass"] else ("FAIL" if val > c["fail"] else "WARN")
     results.append({"id": "1-2", "label": c["label"], "value": f"{val}{c['unit']}", "pass": f"<={c['pass']}", "fail": f">{c['fail']}", "verdict": verdict})
 
-    # MISS avg latency
+    # MISS avg latency — CF Sampler EMA
     c = criteria["miss_avg_latency"]
-    val = p_miss_actual if p_miss_actual > 0 else (cf_lat["miss_ms"] if cf_lat["miss_ms"] > 0 else snap["miss"]["avg"])
+    val = cf_lat["miss_ms"] if cf_lat["miss_ms"] > 0 else snap["miss"]["avg"]
     verdict = "PASS" if val <= c["pass"] else ("FAIL" if val > c["fail"] else "WARN")
     results.append({"id": "1-3", "label": c["label"], "value": f"{val}{c['unit']}", "pass": f"<={c['pass']}", "fail": f">{c['fail']}", "verdict": verdict})
 
