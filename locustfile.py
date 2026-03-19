@@ -305,7 +305,10 @@ origin_tracker = OriginReqTracker()
 class CFLatencySampler:
     """Collects CF latency from SamplerUser (shares Locust's connection pool).
     No separate process/thread needed — SamplerUser reports directly.
+    Filters out greenlet scheduling noise (>500ms) to show true CF response time.
     """
+
+    THRESHOLD_MS = 500  # above this = greenlet scheduling overhead, discard
 
     def __init__(self, alpha=0.3):
         self._alpha = alpha
@@ -323,12 +326,14 @@ class CFLatencySampler:
     def record_hit(self, ms):
         with self._lock:
             self._hit_raw = ms
-            self._hit_ms = self._ema(self._hit_ms, ms)
+            if ms <= self.THRESHOLD_MS:
+                self._hit_ms = self._ema(self._hit_ms, ms)
 
     def record_miss(self, ms):
         with self._lock:
             self._miss_raw = ms
-            self._miss_ms = self._ema(self._miss_ms, ms)
+            if ms <= self.THRESHOLD_MS:
+                self._miss_ms = self._ema(self._miss_ms, ms)
 
     def start(self, base_url):
         pass  # SamplerUser handles sampling — no thread/process needed
