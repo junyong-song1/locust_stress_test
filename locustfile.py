@@ -308,7 +308,8 @@ class CFLatencySampler:
     Filters out greenlet scheduling noise (>500ms) to show true CF response time.
     """
 
-    THRESHOLD_MS = 500  # above this = greenlet scheduling overhead, discard
+    HIT_THRESHOLD_MS = 200   # HIT > 200ms = greenlet noise, discard
+    MISS_THRESHOLD_MS = 300  # MISS > 300ms = greenlet noise (origin roundtrip is ~100ms)
 
     def __init__(self, alpha=0.3):
         self._alpha = alpha
@@ -326,13 +327,13 @@ class CFLatencySampler:
     def record_hit(self, ms):
         with self._lock:
             self._hit_raw = ms
-            if ms <= self.THRESHOLD_MS:
+            if ms <= self.HIT_THRESHOLD_MS:
                 self._hit_ms = self._ema(self._hit_ms, ms)
 
     def record_miss(self, ms):
         with self._lock:
             self._miss_raw = ms
-            if ms <= self.THRESHOLD_MS:
+            if ms <= self.MISS_THRESHOLD_MS:
                 self._miss_ms = self._ema(self._miss_ms, ms)
 
     def start(self, base_url):
