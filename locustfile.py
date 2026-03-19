@@ -516,6 +516,8 @@ def on_report_to_master(client_id, data):
         data["custom_throughput_bytes"] = throughput.get_total_bytes()
         # period tracker — snapshot_and_reset so worker accumulates fresh data each report
         data["custom_period"] = period_tracker.snapshot_and_reset(config.CACHE_REPORT_INTERVAL)
+        # CF sampler data from SamplerUser (only the worker running SamplerUser has data)
+        data["custom_cf_sampler"] = cf_sampler.get()
         # reset tracking
         data["custom_reset_ts"] = _worker_reset_ts
 
@@ -629,6 +631,14 @@ def on_worker_report(client_id, data):
         wp = data.get("custom_period")
         if wp and wp:
             _master_period_by_worker[client_id] = wp
+
+        # CF sampler — update master's cf_sampler if worker has non-zero data
+        wcs = data.get("custom_cf_sampler")
+        if wcs:
+            if wcs.get("hit_ms", 0) > 0:
+                cf_sampler.record_hit(wcs["hit_ms"])
+            if wcs.get("miss_ms", 0) > 0:
+                cf_sampler.record_miss(wcs["miss_ms"])
 
 
 _global_environment = None  # Set in on_init
