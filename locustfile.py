@@ -303,90 +303,56 @@ origin_tracker = OriginReqTracker()
 # CF Latency Sampler: native thread (outside gevent) for accurate latency
 # ---------------------------------------------------------------------------
 class CFLatencySampler:
-    """Reads CF latency metrics from Go cf-sampler binary (separate process, fully isolated).
-    Go binary runs on localhost:9999 with its own HTTP client + connection pool.
-    Fallback: if Go sampler is not running, returns zeros.
+    """Collects CF latency from SamplerUser (shares Locust's connection pool).
+    No separate process/thread needed — SamplerUser reports directly.
     """
 
-    GO_SAMPLER_URL = "http://localhost:9999"
-
-    def __init__(self, interval=3.0):
-        self._interval = interval
+    def __init__(self, alpha=0.3):
+        self._alpha = alpha
         self._lock = threading.Lock()
-        self._data = {"hit_ms": 0.0, "miss_ms": 0.0, "hit_raw": 0.0, "miss_raw": 0.0}
-        self._running = False
-        self._thread = None
-        self._process = None
+        self._hit_ms = 0.0
+        self._miss_ms = 0.0
+        self._hit_raw = 0.0
+        self._miss_raw = 0.0
+
+    def _ema(self, old, new):
+        if old == 0:
+            return new
+        return round(old * (1 - self._alpha) + new * self._alpha, 1)
+
+    def record_hit(self, ms):
+        with self._lock:
+            self._hit_raw = ms
+            self._hit_ms = self._ema(self._hit_ms, ms)
+
+    def record_miss(self, ms):
+        with self._lock:
+            self._miss_raw = ms
+            self._miss_ms = self._ema(self._miss_ms, ms)
 
     def start(self, base_url):
-        if self._running:
-            return
-        self._running = True
-        # Start Go sampler as subprocess
-        import subprocess, os
-        sampler_path = os.path.join(os.path.dirname(__file__) or ".", "cf-sampler", "cf-sampler")
-        if os.path.isfile(sampler_path):
-            try:
-                self._process = subprocess.Popen(
-                    [sampler_path, "--url", base_url, "--interval", "3s", "--port", "9999"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                print(f"  [CF Sampler] Go binary started (PID: {self._process.pid})")
-            except Exception as e:
-                print(f"  [CF Sampler] Failed to start Go binary: {e}")
-        else:
-            print(f"  [CF Sampler] Go binary not found at {sampler_path}, metrics will be zero")
-        # Polling thread: read from Go sampler
-        self._thread = threading.Thread(target=self._poll, daemon=True)
-        self._thread.start()
+        pass  # SamplerUser handles sampling — no thread/process needed
 
     def stop(self):
-        self._running = False
-        if self._process:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
-
-    def _poll(self):
-        import requests as _req
-        import time as _t
-        session = _req.Session()
-        _t.sleep(2)  # Wait for Go binary to start
-        while self._running:
-            try:
-                r = session.get(f"{self.GO_SAMPLER_URL}/metrics", timeout=3)
-                if r.status_code == 200:
-                    d = r.json()
-                    with self._lock:
-                        self._data = {
-                            "hit_ms": d.get("hit_ms", 0.0),
-                            "miss_ms": d.get("miss_ms", 0.0),
-                            "hit_raw": d.get("hit_raw", 0.0),
-                            "miss_raw": d.get("miss_raw", 0.0),
-                        }
-            except Exception:
-                pass
-            _t.sleep(self._interval)
+        pass
 
     def get(self):
         with self._lock:
-            return dict(self._data)
+            return {
+                "hit_ms": self._hit_ms,
+                "miss_ms": self._miss_ms,
+                "hit_raw": self._hit_raw,
+                "miss_raw": self._miss_raw,
+            }
 
     def reset(self):
-        import requests as _req
-        try:
-            _req.get(f"{self.GO_SAMPLER_URL}/reset", timeout=3)
-        except Exception:
-            pass
         with self._lock:
-            self._data = {"hit_ms": 0.0, "miss_ms": 0.0, "hit_raw": 0.0, "miss_raw": 0.0}
+            self._hit_ms = 0.0
+            self._miss_ms = 0.0
+            self._hit_raw = 0.0
+            self._miss_raw = 0.0
 
-cf_sampler = CFLatencySampler(interval=5.0)
+cf_sampler = CFLatencySampler()
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +980,52 @@ class TimeMachineUser(FastHttpUser):
         max_delay = max(config.TIME_DELAY_MIN, min(elapsed, config.TIME_DELAY_MAX))
         self.time_delay = random.randint(config.TIME_DELAY_MIN, max_delay)
         _watch_stream(self)
+
+
+# ---------------------------------------------------------------------------
+# CF Latency Sampler User — shares Locust's connection pool
+# ---------------------------------------------------------------------------
+class SamplerUser(FastHttpUser):
+    """Dedicated user for CF latency sampling. fixed_count=1 → exactly 1 instance.
+    Shares FastHttpUser's connection pool with LiveUser/TimeMachineUser.
+    Results reported to cf_sampler (EMA smoothed).
+    """
+    fixed_count = 1
+    wait_time = constant(3)  # sample every 3 seconds
+    max_retries = 0
+    max_redirects = 0
+    connection_timeout = 10.0
+    network_timeout = 10.0
+
+    @task
+    def sample_latency(self):
+        # HIT sample: TM URL with large time_delay (likely cached)
+        hit_path = f"{_relative_path(config.BASE_URL + '/' + config.RENDITIONS[2]['name'] + '.m3u8')}?aws.manifestsettings=time_delay:{config.TIME_DELAY_MAX // 2}"
+        t0 = time.time()
+        try:
+            with self.client.get(hit_path, name="[sampler] HIT", catch_response=True) as resp:
+                ms = round((time.time() - t0) * 1000, 1)
+                hdrs = getattr(resp, "headers", None)
+                x_cache = (_get_hdr(hdrs, "x-cache") or "").lower()
+                if "hit" in x_cache:
+                    cf_sampler.record_hit(ms)
+                resp.success()
+        except Exception:
+            pass
+
+        # MISS sample: live URL (max-age=1 → likely miss)
+        miss_path = _relative_path(config.BASE_URL + "/" + config.RENDITIONS[2]["name"] + ".m3u8")
+        t1 = time.time()
+        try:
+            with self.client.get(miss_path, name="[sampler] MISS", catch_response=True) as resp:
+                ms = round((time.time() - t1) * 1000, 1)
+                hdrs = getattr(resp, "headers", None)
+                x_cache = (_get_hdr(hdrs, "x-cache") or "").lower()
+                if "miss" in x_cache:
+                    cf_sampler.record_miss(ms)
+                resp.success()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
