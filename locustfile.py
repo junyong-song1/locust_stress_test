@@ -303,91 +303,88 @@ origin_tracker = OriginReqTracker()
 # CF Latency Sampler: native thread (outside gevent) for accurate latency
 # ---------------------------------------------------------------------------
 class CFLatencySampler:
-    """Periodically sample CF response time from a native thread (no gevent overhead).
-    Uses exponential moving average to smooth out spikes.
+    """Reads CF latency metrics from Go cf-sampler binary (separate process, fully isolated).
+    Go binary runs on localhost:9999 with its own HTTP client + connection pool.
+    Fallback: if Go sampler is not running, returns zeros.
     """
 
-    def __init__(self, interval=5.0, alpha=0.3):
+    GO_SAMPLER_URL = "http://localhost:9999"
+
+    def __init__(self, interval=3.0):
         self._interval = interval
-        self._alpha = alpha  # EMA smoothing factor (0.3 = recent 30% + history 70%)
         self._lock = threading.Lock()
-        self._hit_ms = 0.0
-        self._miss_ms = 0.0
-        self._hit_raw = 0.0   # latest raw sample
-        self._miss_raw = 0.0
+        self._data = {"hit_ms": 0.0, "miss_ms": 0.0, "hit_raw": 0.0, "miss_raw": 0.0}
         self._running = False
         self._thread = None
+        self._process = None
 
     def start(self, base_url):
         if self._running:
             return
         self._running = True
-        self._base_url = base_url
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        # Start Go sampler as subprocess
+        import subprocess, os
+        sampler_path = os.path.join(os.path.dirname(__file__) or ".", "cf-sampler", "cf-sampler")
+        if os.path.isfile(sampler_path):
+            try:
+                self._process = subprocess.Popen(
+                    [sampler_path, "--url", base_url, "--interval", "3s", "--port", "9999"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                print(f"  [CF Sampler] Go binary started (PID: {self._process.pid})")
+            except Exception as e:
+                print(f"  [CF Sampler] Failed to start Go binary: {e}")
+        else:
+            print(f"  [CF Sampler] Go binary not found at {sampler_path}, metrics will be zero")
+        # Polling thread: read from Go sampler
+        self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
-
-    def _ema(self, old, new):
-        """Exponential moving average."""
-        if old == 0:
-            return new
-        return round(old * (1 - self._alpha) + new * self._alpha, 1)
-
-    def _run(self):
-        import requests as _req
-        import time as _t
-        # Session keeps TCP+TLS alive — no reconnect overhead per sample
-        session = _req.Session()
-        while self._running:
+        if self._process:
             try:
-                # HIT sample: TM URL (long cache TTL)
-                hit_url = f"{self._base_url}/playlist_3.m3u8?aws.manifestsettings=time_delay:3600"
-                r1 = session.get(hit_url, timeout=10)
-                ms1 = round(r1.elapsed.total_seconds() * 1000, 1)
-                x1 = (r1.headers.get("x-cache") or "").lower()
-
-                # MISS sample: live URL (max-age=1)
-                miss_url = f"{self._base_url}/playlist_3.m3u8"
-                r2 = session.get(miss_url, timeout=10)
-                ms2 = round(r2.elapsed.total_seconds() * 1000, 1)
-                x2 = (r2.headers.get("x-cache") or "").lower()
-
-                with self._lock:
-                    if "hit" in x1:
-                        self._hit_raw = ms1
-                        self._hit_ms = self._ema(self._hit_ms, ms1)
-                    if "hit" not in x2:
-                        self._miss_raw = ms2
-                        self._miss_ms = self._ema(self._miss_ms, ms2)
-                    elif "hit" not in x1:
-                        self._miss_raw = ms1
-                        self._miss_ms = self._ema(self._miss_ms, ms1)
+                self._process.terminate()
+                self._process.wait(timeout=5)
             except Exception:
-                # 연결 끊기면 세션 재생성
                 try:
-                    session.close()
+                    self._process.kill()
                 except Exception:
                     pass
-                session = _req.Session()
+
+    def _poll(self):
+        import requests as _req
+        import time as _t
+        session = _req.Session()
+        _t.sleep(2)  # Wait for Go binary to start
+        while self._running:
+            try:
+                r = session.get(f"{self.GO_SAMPLER_URL}/metrics", timeout=3)
+                if r.status_code == 200:
+                    d = r.json()
+                    with self._lock:
+                        self._data = {
+                            "hit_ms": d.get("hit_ms", 0.0),
+                            "miss_ms": d.get("miss_ms", 0.0),
+                            "hit_raw": d.get("hit_raw", 0.0),
+                            "miss_raw": d.get("miss_raw", 0.0),
+                        }
+            except Exception:
+                pass
             _t.sleep(self._interval)
 
     def get(self):
         with self._lock:
-            return {
-                "hit_ms": self._hit_ms,
-                "miss_ms": self._miss_ms,
-                "hit_raw": self._hit_raw,
-                "miss_raw": self._miss_raw,
-            }
+            return dict(self._data)
 
     def reset(self):
+        import requests as _req
+        try:
+            _req.get(f"{self.GO_SAMPLER_URL}/reset", timeout=3)
+        except Exception:
+            pass
         with self._lock:
-            self._hit_ms = 0.0
-            self._miss_ms = 0.0
-            self._hit_raw = 0.0
-            self._miss_raw = 0.0
+            self._data = {"hit_ms": 0.0, "miss_ms": 0.0, "hit_raw": 0.0, "miss_raw": 0.0}
 
 cf_sampler = CFLatencySampler(interval=5.0)
 
