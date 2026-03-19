@@ -816,13 +816,16 @@ def _pick_rendition():
 # User classes
 # ---------------------------------------------------------------------------
 def _watch_stream(user):
-    """Common HLS streaming logic with weighted rendition selection."""
+    """Common HLS streaming logic with weighted rendition selection.
+    Tracks response metrics directly (moved from on_request for performance).
+    """
+    global _req_counter
     pfx = f"[{user.user_type}]"
 
     # 1. Pick rendition by weight
     rendition = _pick_rendition()
-    rend_name = rendition["name"]          # URL path: playlist_1, playlist_2, ...
-    rend_label = rendition.get("label", rend_name)  # Display: AVC 1080p 7.8M, ...
+    rend_name = rendition["name"]
+    rend_label = rendition.get("label", rend_name)
     codec = rendition["codec"]
 
     # 2. Build variant playlist URL directly (skip master playlist)
@@ -833,27 +836,88 @@ def _watch_stream(user):
 
     # 3. Fetch variant (media) playlist
     td = getattr(user, "time_delay", None)
+    t0 = time.time()
     with user.client.get(
         _relative_path(variant_url),
         name=f"{pfx} {rend_label}",
         context={"full_url": variant_url, "rendition": rend_label, "codec": codec, "time_delay": td},
         catch_response=True,
     ) as resp:
-        # 404 = DVR 윈도우 밖의 time_delay 요청 → 정상 처리
         if resp.status_code == 404:
             resp.success()
             return
         elif resp.status_code != 200:
             resp.failure(f"HTTP {resp.status_code}")
+            resp_tracker.record(0, False, rend_label, codec, is_error=True)
             return
         resp.success()
-    # Fast header extraction for collector (only 3 headers needed)
-    _rh = resp.headers
+
+    # --- Inline tracking (no on_request overhead) ---
+    response_time_ms = round((time.time() - t0) * 1000, 1)
+    hdrs = getattr(resp, "headers", None)
+    x_cache = (_get_hdr(hdrs, "x-cache") or "").lower()
+    is_hit = "hit" in x_cache
+    is_error = resp.status_code >= 400
+
+    resp_tracker.record(response_time_ms, is_hit, rend_label, codec, is_error=is_error)
+    origin_tracker.record(not is_hit)
+    resp_length = getattr(resp, "_content_length", 0) or 0
+    period_tracker.record(is_hit, is_error, response_time_ms, resp_length, actual_ms=response_time_ms)
+
+    # Collector (cache metrics for dashboard)
     collector.record(user.user_type, "variant", {
-        "x-cache": _get_hdr(_rh, "x-cache") or "",
-        "age": _get_hdr(_rh, "age") or "",
-        "x-amz-cf-pop": _get_hdr(_rh, "x-amz-cf-pop") or "",
+        "x-cache": _get_hdr(hdrs, "x-cache") or "",
+        "age": _get_hdr(hdrs, "age") or "",
+        "x-amz-cf-pop": _get_hdr(hdrs, "x-amz-cf-pop") or "",
     })
+
+    # --- Sampled: request_log + PDT (every Nth request) ---
+    _req_counter += 1
+    if _req_counter % LOG_SAMPLE_RATE == 0:
+        age_str = _get_hdr(hdrs, "age") or "-"
+        pop = _get_hdr(hdrs, "x-amz-cf-pop") or "-"
+
+        pdt_info = None
+        try:
+            resp_text = resp.text or ""
+            if resp_text:
+                pdt_matches = _PDT_RE.findall(resp_text)
+                if pdt_matches:
+                    pdt_iso = pdt_matches[-1]
+                    pdt_dt = datetime.fromisoformat(pdt_iso.replace("Z", "+00:00"))
+                    diff_sec = round((datetime.now(timezone.utc) - pdt_dt).total_seconds() - 2.0, 1)
+                    if td is not None:
+                        pdt_info = {"pdt": pdt_iso, "diff_sec": diff_sec, "tm_accuracy": round(diff_sec - td, 1)}
+                    else:
+                        pdt_info = {"pdt": pdt_iso, "diff_sec": diff_sec, "live_latency": diff_sec}
+        except Exception:
+            pass
+
+        _p = urlparse(variant_url)
+        url = _p.path + ("?" + _p.query if _p.query else "")
+
+        with request_log_lock:
+            request_log.append({
+                "ts": time.strftime("%H:%M:%S"),
+                "name": f"{pfx} {rend_label}",
+                "url": url,
+                "status": resp.status_code,
+                "size": f"{resp_length} B" if resp_length < 1024 else f"{resp_length / 1024:.1f} KB",
+                "size_bytes": resp_length,
+                "cf_cache": _get_hdr(hdrs, "x-cache") or "-",
+                "cf_pop": pop,
+                "cf_age": age_str,
+                "cache_control": _get_hdr(hdrs, "cache-control") or "-",
+                "via": _get_hdr(hdrs, "via") or "-",
+                "origin_id": _get_hdr(hdrs, "x-amzn-requestid") or _get_hdr(hdrs, "x-mediapackage-request-id") or "-",
+                "latency_ms": response_time_ms,
+                "actual_ms": response_time_ms,
+                "overhead_ms": 0.0,
+                "pdt": pdt_info.get("pdt", "-") if pdt_info else "-",
+                "pdt_diff": pdt_info.get("diff_sec") if pdt_info else None,
+                "tm_accuracy": pdt_info.get("tm_accuracy") if pdt_info else None,
+                "live_latency": pdt_info.get("live_latency") if pdt_info else None,
+            })
 
     # 4. Fetch segments
     if config.FETCH_SEGMENTS:
@@ -939,123 +1003,26 @@ if config.USE_LOAD_SHAPE:
 # ---------------------------------------------------------------------------
 @events.request.add_listener
 def on_request(name, response, exception, response_time, **kwargs):
-    global _req_counter
-
+    """Lightweight handler — cache hit/miss counting only. No locks.
+    Heavy tracking (resp_tracker, period_tracker, request_log) moved to _watch_stream.
+    """
     if response is None:
-        ctx = kwargs.get("context", {}) or {}
-        resp_tracker.record(0, False, ctx.get("rendition"), ctx.get("codec"), is_error=True)
         return
 
-    # --- Fast path: extract only essential headers (no full iteration) ---
     hdrs = getattr(response, "headers", None)
     x_cache = (_get_hdr(hdrs, "x-cache") or "").lower()
-    is_hit = "hit" in x_cache
-    # Locust native: 404 is success (catch_response), but custom dashboard tracks it as error
-    is_error = response.status_code >= 400
 
-    # Cache stats (lightweight dict ops, no lock)
     cs = cache_stats.get(name)
     if cs is None:
-        cs = {"hit": 0, "miss": 0, "noinfo": 0, "ages": [], "last_pop": "-"}
+        cs = {"hit": 0, "miss": 0, "noinfo": 0}
         cache_stats[name] = cs
 
-    if is_hit:
+    if "hit" in x_cache:
         cs["hit"] += 1
     elif "miss" in x_cache:
         cs["miss"] += 1
     else:
         cs["noinfo"] += 1
-
-    # Response size
-    resp_length = kwargs.get("response_length", 0) or 0
-
-    # Actual ms (FastHttpUser: response_time ≈ actual CF time)
-    actual_ms = round(response_time, 1)
-
-    # --- Core trackers (kept — essential for dashboard) ---
-    ctx = kwargs.get("context", {}) or {}
-    resp_tracker.record(response_time, is_hit, ctx.get("rendition"), ctx.get("codec"), is_error=is_error)
-    origin_tracker.record(not is_hit)
-    period_tracker.record(is_hit, is_error, response_time, resp_length, actual_ms=actual_ms)
-
-    # --- Sampled path: heavy ops only every Nth request ---
-    _req_counter += 1
-    if _req_counter % LOG_SAMPLE_RATE != 0:
-        return
-
-    # Age (sampled)
-    age_str = _get_hdr(hdrs, "age")
-    if age_str:
-        try:
-            ages = cs["ages"]
-            ages.append(float(age_str))
-            if len(ages) > 200:
-                cs["ages"] = ages[-100:]
-        except (ValueError, TypeError):
-            pass
-
-    pop = _get_hdr(hdrs, "x-amz-cf-pop") or "-"
-    cs["last_pop"] = pop
-
-    # PDT parsing (sampled)
-    pdt_info = None
-    if "segment" not in name:
-        try:
-            resp_text = response.text or ""
-        except Exception:
-            resp_text = ""
-        if resp_text:
-            pdt_matches = _PDT_RE.findall(resp_text)
-            if pdt_matches:
-                try:
-                    pdt_iso = pdt_matches[-1]
-                    pdt_dt = datetime.fromisoformat(pdt_iso.replace("Z", "+00:00"))
-                    diff_sec = round((datetime.now(timezone.utc) - pdt_dt).total_seconds() - 2.0, 1)
-                    td = ctx.get("time_delay")
-                    if td is not None:
-                        pdt_info = {"pdt": pdt_iso, "diff_sec": diff_sec, "tm_accuracy": round(diff_sec - td, 1)}
-                    else:
-                        pdt_info = {"pdt": pdt_iso, "diff_sec": diff_sec, "live_latency": diff_sec}
-                except (ValueError, TypeError):
-                    pass
-
-    # Request log entry (sampled)
-    raw_url = ctx.get("full_url", "") or name
-    if raw_url.startswith("http"):
-        _p = urlparse(raw_url)
-        url = _p.path + ("?" + _p.query if _p.query else "")
-    else:
-        url = raw_url
-
-    if resp_length >= 1_048_576:
-        size_str = f"{resp_length / 1_048_576:.1f} MB"
-    elif resp_length >= 1024:
-        size_str = f"{resp_length / 1024:.1f} KB"
-    else:
-        size_str = f"{resp_length} B"
-
-    with request_log_lock:
-        request_log.append({
-            "ts": time.strftime("%H:%M:%S"),
-            "name": name,
-            "url": str(url),
-            "status": response.status_code,
-            "size": size_str,
-            "size_bytes": resp_length,
-            "cf_cache": _get_hdr(hdrs, "x-cache") or "-",
-            "cf_pop": pop,
-            "cf_age": age_str or "-",
-            "cache_control": _get_hdr(hdrs, "cache-control") or "-",
-            "via": _get_hdr(hdrs, "via") or "-",
-            "origin_id": _get_hdr(hdrs, "x-amzn-requestid") or _get_hdr(hdrs, "x-mediapackage-request-id") or "-",
-            "latency_ms": actual_ms,
-            "actual_ms": actual_ms,
-            "overhead_ms": 0.0,
-            "pdt": pdt_info.get("pdt", "-") if pdt_info else "-",
-            "pdt_diff": pdt_info.get("diff_sec") if pdt_info else None,
-            "tm_accuracy": pdt_info.get("tm_accuracy") if pdt_info else None,
-            "live_latency": pdt_info.get("live_latency") if pdt_info else None,
-        })
 
 
 @events.reset_stats.add_listener
