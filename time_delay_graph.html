@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>TimeMachine time_delay 슬라이딩 윈도우</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;padding:20px}
+  h1{color:#38bdf8;font-size:1.4rem;margin-bottom:4px}
+  .sub{color:#64748b;font-size:.85rem;margin-bottom:20px}
+  .chart-wrap{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px}
+  .chart-wrap h2{color:#94a3b8;font-size:.95rem;margin:0 0 4px}
+  .chart-wrap .desc{color:#475569;font-size:.8rem;margin-bottom:12px}
+  .chart-inner{position:relative;height:320px;width:100%}
+  .config{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px;display:flex;gap:20px;align-items:center;flex-wrap:wrap}
+  .config label{color:#94a3b8;font-size:.85rem}
+  .config input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:4px;width:100px;font-size:.9rem}
+  .config button{background:#4ade80;color:#0f172a;border:none;padding:8px 20px;border-radius:6px;font-weight:700;cursor:pointer;font-size:.85rem}
+  .config button:hover{background:#22c55e}
+  .timeline{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px}
+  .timeline h2{color:#94a3b8;font-size:.95rem;margin:0 0 12px}
+  .tl-row{display:flex;align-items:center;gap:12px;margin:6px 0;font-size:.8rem}
+  .tl-time{color:#38bdf8;font-weight:700;min-width:60px;text-align:right}
+  .tl-bar-wrap{flex:1;height:32px;background:#0f172a;border-radius:4px;position:relative;overflow:hidden}
+  .tl-bar{height:100%;border-radius:4px;position:absolute;display:flex;align-items:center;justify-content:center;font-size:.7rem;font-weight:600;color:#0f172a}
+  .tl-info{min-width:320px;font-size:.75rem;display:flex;gap:16px}
+  .tl-info .param{color:#4ade80;font-weight:700}
+  .tl-info .content{color:#38bdf8}
+  .tl-info .phase{color:#facc15;font-size:.7rem}
+</style>
+</head>
+<body>
+<h1>TimeMachine time_delay 슬라이딩 윈도우</h1>
+<div class="sub">time_delay 파라미터 값은 항상 MIN~MAX 범위 내. 콘텐츠 윈도우는 시간이 흐르면서 자동 슬라이딩.</div>
+
+<div class="config">
+  <label>TIME_DELAY_MIN <input type="number" id="cfgMin" value="1" min="1"></label>
+  <label>TIME_DELAY_MAX <input type="number" id="cfgMax" value="100" min="1"></label>
+  <label>테스트 총 시간(초) <input type="number" id="cfgDuration" value="300" min="10"></label>
+  <button onclick="render()">적용</button>
+</div>
+
+<div class="timeline" id="timelineWrap">
+  <h2>타임라인 시각화</h2>
+  <div id="timelineBody"></div>
+</div>
+
+<div class="chart-wrap">
+  <h2>1. time_delay 파라미터 값 범위 (API 호출 시 실제 사용되는 값)</h2>
+  <div class="desc">X축 = 테스트 시작 후 경과시간 | Y축 = time_delay 값 (몇 초 전 콘텐츠를 요청하는지) | Phase 1: 성장 → Phase 2: MIN~MAX 고정</div>
+  <div class="chart-inner"><canvas id="c1"></canvas></div>
+</div>
+
+<div class="chart-wrap">
+  <h2>2. 실제 콘텐츠 윈도우 (테스트 시작 기준 절대 시간)</h2>
+  <div class="desc">X축 = 테스트 경과시간 | Y축 = 콘텐츠 절대 위치 (테스트 시작=0초) | Phase 2에서 delay 값은 같지만 콘텐츠 구간이 자동 슬라이딩</div>
+  <div class="chart-inner"><canvas id="c2"></canvas></div>
+</div>
+
+<div class="chart-wrap">
+  <h2>3. 캐시키 수 변화 (렌디션 14개 x time_delay 범위)</h2>
+  <div class="desc">Phase 1에서 증가, Phase 2에서 고정 (슬라이딩이므로 새 키 생성 + 오래된 키 만료 = 총 수 일정)</div>
+  <div class="chart-inner"><canvas id="c3"></canvas></div>
+</div>
+
+<script>
+var charts = {};
+
+function calcDelay(elapsed, tdMin, tdMax) {
+  // Phase 1: elapsed < tdMax → range grows
+  // Phase 2: elapsed >= tdMax → range fixed at MIN~MAX (content window auto-slides)
+  if (elapsed <= 0) return {min: tdMin, max: tdMin};
+  if (elapsed < tdMax) {
+    return {min: tdMin, max: Math.max(tdMin, elapsed)};
+  } else {
+    return {min: tdMin, max: tdMax};
+  }
+}
+
+function calcContentWindow(elapsed, tdMin, tdMax) {
+  // What absolute time range does the time_delay map to?
+  var d = calcDelay(elapsed, tdMin, tdMax);
+  // time_delay=d.max → content from (elapsed - d.max) seconds from start
+  // time_delay=d.min → content from (elapsed - d.min) seconds from start
+  return {start: Math.max(0, elapsed - d.max), end: Math.max(0, elapsed - d.min)};
+}
+
+function fmtTime(s) {
+  return s + 's';
+}
+
+function render() {
+  var tdMin = parseInt(document.getElementById('cfgMin').value) || 1;
+  var tdMax = parseInt(document.getElementById('cfgMax').value) || 100;
+  var duration = parseInt(document.getElementById('cfgDuration').value) || 300;
+  var step = Math.max(1, Math.floor(duration / 200));
+
+  var points = [];
+  for (var t = 0; t <= duration; t += step) {
+    var d = calcDelay(t, tdMin, tdMax);
+    var cw = calcContentWindow(t, tdMin, tdMax);
+    points.push({t:t, dMin:d.min, dMax:d.max, cwStart:cw.start, cwEnd:cw.end, keys:(d.max-d.min+1)*14});
+  }
+  var labels = points.map(function(p){return fmtTime(p.t);});
+
+  // Timeline
+  var tlBody = document.getElementById('timelineBody');
+  var tlTimes = [0];
+  for (var i = 1; i <= 10; i++) tlTimes.push(Math.floor(duration * i / 10));
+  if (tlTimes.indexOf(tdMax) === -1) tlTimes.push(tdMax);
+  tlTimes.sort(function(a,b){return a-b;});
+  tlTimes = tlTimes.filter(function(v,i,a){return i===0||v!==a[i-1];});
+
+  var html = '<div style="display:flex;gap:24px;margin-bottom:12px;font-size:.75rem;color:#64748b">'
+    +'<span><span style="display:inline-block;width:12px;height:12px;background:#4ade80;border-radius:2px;vertical-align:middle;margin-right:4px"></span>Phase 1 (성장)</span>'
+    +'<span><span style="display:inline-block;width:12px;height:12px;background:#38bdf8;border-radius:2px;vertical-align:middle;margin-right:4px"></span>Phase 2 (슬라이딩)</span>'
+    +'<span style="margin-left:auto">바 = 콘텐츠 윈도우 (절대 시간)</span></div>';
+
+  tlTimes.forEach(function(t) {
+    var d = calcDelay(t, tdMin, tdMax);
+    var cw = calcContentWindow(t, tdMin, tdMax);
+    var phase = t < tdMax ? '1' : '2';
+    var color = phase === '1' ? '#4ade80' : '#38bdf8';
+    var leftPct = (cw.start / duration * 100).toFixed(1);
+    var widthPct = (Math.max(1, cw.end - cw.start) / duration * 100).toFixed(1);
+
+    html += '<div class="tl-row">';
+    html += '<span class="tl-time">' + fmtTime(t) + '</span>';
+    html += '<div class="tl-bar-wrap">';
+    html += '<div class="tl-bar" style="left:'+leftPct+'%;width:'+Math.max(0.5,parseFloat(widthPct))+'%;background:'+color+'">';
+    if (parseFloat(widthPct) > 6) html += 'delay: ' + d.min + ' ~ ' + d.max;
+    html += '</div></div>';
+    html += '<div class="tl-info">';
+    html += '<span class="param">delay: ' + d.min + ' ~ ' + d.max + '</span>';
+    html += '<span class="content">콘텐츠: ' + fmtTime(cw.start) + ' ~ ' + fmtTime(cw.end) + '</span>';
+    html += '<span class="phase">' + (phase==='1'?'Phase 1':'Phase 2') + '</span>';
+    html += '</div></div>';
+  });
+  tlBody.innerHTML = html;
+
+  // Chart 1: time_delay parameter range
+  var phaseIdx = 0;
+  for (var i = 0; i < points.length; i++) { if (points[i].t >= tdMax) { phaseIdx = i; break; } }
+
+  if (charts.c1) charts.c1.destroy();
+  charts.c1 = new Chart(document.getElementById('c1'), {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {label:'time_delay MAX', data:points.map(function(p){return p.dMax;}), borderColor:'#38bdf8', backgroundColor:'rgba(56,189,248,0.15)', fill:'+1', borderWidth:2, pointRadius:0, tension:0.1},
+        {label:'time_delay MIN', data:points.map(function(p){return p.dMin;}), borderColor:'#4ade80', backgroundColor:'transparent', borderWidth:2, pointRadius:0, tension:0.1},
+        {label:'TIME_DELAY_MAX ('+tdMax+')', data:points.map(function(){return tdMax;}), borderColor:'#f87171', borderDash:[6,3], borderWidth:1, pointRadius:0},
+      ]
+    },
+    options: {
+      responsive:true,maintainAspectRatio:false,animation:{duration:0},
+      plugins:{
+        legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}},
+        tooltip:{mode:'index',intersect:false,backgroundColor:'#1e293b',titleColor:'#e2e8f0',bodyColor:'#e2e8f0',borderColor:'#334155',borderWidth:1,
+          callbacks:{afterBody:function(items){var p=points[items[0].dataIndex];return 'random('+p.dMin+', '+p.dMax+')\n윈도우 폭: '+(p.dMax-p.dMin);}}},
+        annotation:{annotations:{phaseLine:{type:'line',xMin:phaseIdx,xMax:phaseIdx,borderColor:'#facc15',borderWidth:2,borderDash:[6,3],
+          label:{display:true,content:'Phase 2 시작 ('+fmtTime(tdMax)+')',color:'#facc15',backgroundColor:'rgba(0,0,0,0.7)',font:{size:11},position:'start'}}}}
+      },
+      scales:{
+        x:{grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10},maxTicksLimit:20},title:{display:true,text:'테스트 경과시간',color:'#64748b'}},
+        y:{grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10}},beginAtZero:true,title:{display:true,text:'time_delay 파라미터 값 (초)',color:'#64748b'}}
+      }
+    }
+  });
+
+  // Chart 2: Content window (absolute time)
+  if (charts.c2) charts.c2.destroy();
+  charts.c2 = new Chart(document.getElementById('c2'), {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {label:'콘텐츠 끝 (최근)', data:points.map(function(p){return p.cwEnd;}), borderColor:'#4ade80', backgroundColor:'rgba(56,189,248,0.12)', fill:'+1', borderWidth:2, pointRadius:0, tension:0.1},
+        {label:'콘텐츠 시작 (과거)', data:points.map(function(p){return p.cwStart;}), borderColor:'#38bdf8', backgroundColor:'transparent', borderWidth:2, pointRadius:0, tension:0.1},
+        {label:'현재 시간 (elapsed)', data:points.map(function(p){return p.t;}), borderColor:'#facc15', borderDash:[4,4], borderWidth:1.5, pointRadius:0, tension:0.1},
+      ]
+    },
+    options: {
+      responsive:true,maintainAspectRatio:false,animation:{duration:0},
+      plugins:{
+        legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}},
+        tooltip:{mode:'index',intersect:false,backgroundColor:'#1e293b',titleColor:'#e2e8f0',bodyColor:'#e2e8f0',borderColor:'#334155',borderWidth:1,
+          callbacks:{afterBody:function(items){var p=points[items[0].dataIndex];return '콘텐츠 구간: '+fmtTime(p.cwStart)+' ~ '+fmtTime(p.cwEnd)+'\n구간 폭: '+fmtTime(p.cwEnd-p.cwStart);}}},
+        annotation:{annotations:{phaseLine:{type:'line',xMin:phaseIdx,xMax:phaseIdx,borderColor:'#facc15',borderWidth:2,borderDash:[6,3],
+          label:{display:true,content:'Phase 2 시작',color:'#facc15',backgroundColor:'rgba(0,0,0,0.7)',font:{size:11},position:'start'}}}}
+      },
+      scales:{
+        x:{grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10},maxTicksLimit:20},title:{display:true,text:'테스트 경과시간',color:'#64748b'}},
+        y:{grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10},callback:function(v){return fmtTime(v);}},beginAtZero:true,title:{display:true,text:'절대 시간 (테스트 시작 기준)',color:'#64748b'}}
+      }
+    }
+  });
+
+  // Chart 3: Cache keys
+  if (charts.c3) charts.c3.destroy();
+  charts.c3 = new Chart(document.getElementById('c3'), {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {label:'총 캐시키 수', data:points.map(function(p){return p.keys;}), borderColor:'#facc15', backgroundColor:'rgba(250,204,21,0.1)', fill:true, borderWidth:2, pointRadius:0, tension:0.1},
+        {label:'최대 ('+((tdMax-tdMin+1)*14).toLocaleString()+')', data:points.map(function(){return (tdMax-tdMin+1)*14;}), borderColor:'#f87171', borderDash:[6,3], borderWidth:1, pointRadius:0}
+      ]
+    },
+    options: {
+      responsive:true,maintainAspectRatio:false,animation:{duration:0},
+      plugins:{legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}},tooltip:{mode:'index',intersect:false,backgroundColor:'#1e293b',titleColor:'#e2e8f0',bodyColor:'#e2e8f0',borderColor:'#334155',borderWidth:1},
+        annotation:{annotations:{phaseLine:{type:'line',xMin:phaseIdx,xMax:phaseIdx,borderColor:'#facc15',borderWidth:2,borderDash:[6,3],
+          label:{display:true,content:'Phase 2 — 캐시키 수 고정',color:'#facc15',backgroundColor:'rgba(0,0,0,0.7)',font:{size:11},position:'start'}}}}},
+      scales:{
+        x:{grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10},maxTicksLimit:20},title:{display:true,text:'테스트 경과시간',color:'#64748b'}},
+        y:{grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10}},beginAtZero:true,title:{display:true,text:'캐시키 수',color:'#64748b'}}
+      }
+    }
+  });
+}
+
+render();
+</script>
+</body>
+</html>
