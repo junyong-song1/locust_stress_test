@@ -34,16 +34,13 @@ class CacheMetricsCollector:
         self._period_pops = defaultdict(lambda: defaultdict(int))
         self._initialized = True
 
-    def record(self, user_type: str, request_type: str, headers: dict):
-        """Record cache metrics from response headers.
-
-        Expects headers pre-normalized to {lowercase_key: str_value} via _norm_headers().
-        """
+    def record(self, user_type: str, request_type: str,
+               x_cache_raw: str = "", age_raw: str = "", pop_raw: str = ""):
+        """Record cache metrics from response header values (passed directly)."""
         key = (user_type, request_type)
-        h = headers  # Already normalized by caller
-        x_cache = h.get("x-cache", "").lower()
-        age = h.get("age")
-        pop = h.get("x-amz-cf-pop", "")
+        x_cache = x_cache_raw.lower()
+        age = age_raw or None
+        pop = pop_raw
 
         is_hit = "hit" in x_cache
 
@@ -109,6 +106,15 @@ class CacheMetricsCollector:
             self._period_age_sum.clear()
             self._period_age_count.clear()
             self._period_pops.clear()
+
+    def reset_cumulative(self):
+        """Clear cumulative stats only, preserving periodic counters."""
+        with self._data_lock:
+            self._hits.clear()
+            self._misses.clear()
+            self._age_sum.clear()
+            self._age_count.clear()
+            self._pops.clear()
 
     def snapshot_periodic(self) -> list[dict]:
         """Return periodic stats and reset period counters."""

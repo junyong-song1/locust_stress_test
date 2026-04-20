@@ -7,6 +7,8 @@ except ImportError:
     def _dumps(obj):
         return json.dumps(obj, ensure_ascii=False)
 
+import bisect
+import itertools
 import json  # keep for json.load/json.dumps in non-hot paths
 import random
 import re
@@ -35,10 +37,31 @@ _PDT_RE = re.compile(r'#EXT-X-PROGRAM-DATE-TIME:(\S+)')
 # Per-request cache stats for Locust native tab (keyed by request name)
 cache_stats = {}
 
-# Recent request URL log (circular buffer)
-REQUEST_LOG_MAX = 50000
+# Recent request URL log (circular buffer) — H5: 50K→10K to save ~55MB/worker
+REQUEST_LOG_MAX = 10000
 request_log = deque(maxlen=REQUEST_LOG_MAX)
 request_log_lock = threading.Lock()
+
+# C2: Pre-compute base path to eliminate urlparse() from hot path
+# config.STREAM_PATH 사용 — Locust --host 또는 STREAM_PATH 환경변수로 변경 가능
+_BASE_PATH = config.STREAM_PATH  # e.g. "/out/v1/stress-test-ch/..."
+
+# CF → ALB 우회를 위한 Host 헤더 (빈 문자열이면 헤더 미설정)
+# config.HOST_HEADER = "aws-kbo-smart-cloudfront.tving.com" 기본값
+_HOST_OVERRIDE = (getattr(config, "HOST_HEADER", "") or "").strip()
+_DEFAULT_HEADERS = {"Host": _HOST_OVERRIDE} if _HOST_OVERRIDE else {}
+
+# H2: Pre-compute rendition name→label lookup + request name cache
+_RENDITION_LABEL = {r["name"]: r.get("label", r["name"]) for r in config.RENDITIONS}
+_RENDITION_CODEC = {r["name"]: r["codec"] for r in config.RENDITIONS}
+_NAME_CACHE = {}
+for _ut in ("live", "timemachine"):
+    for _r in config.RENDITIONS:
+        _NAME_CACHE[(_ut, _r["name"])] = f"[{_ut}] {_r.get('label', _r['name'])}"
+
+# L1: Pre-compute cumulative weights for bisect (replaces random.choices overhead)
+_CUM_WEIGHTS = list(itertools.accumulate(config.RENDITION_WEIGHTS))
+_TOTAL_WEIGHT = _CUM_WEIGHTS[-1]
 
 # Current phase tracking
 current_phase = {"name": "-", "started_at": None}
@@ -59,8 +82,9 @@ class MetricsTimeSeries:
 
     def get(self, last_n=120):
         with self._lock:
-            pts = list(self._points)
-        return pts[-last_n:]
+            n = min(last_n, len(self._points))
+            start = len(self._points) - n
+            return [self._points[i] for i in range(start, len(self._points))]
 
     def reset(self):
         with self._lock:
@@ -232,6 +256,47 @@ class ResponseTimeTracker:
             self._by_codec.clear()
             self._total_requests = 0
             self._error_count = 0
+
+    def snapshot_and_reset(self):
+        """Atomic snapshot + reset to avoid race window between separate calls."""
+        with self._lock:
+            result = {
+                "hit": self._hit.to_dict(),
+                "miss": self._miss.to_dict(),
+                "total_requests": self._total_requests,
+                "error_count": self._error_count,
+                "error_rate": round(self._error_count / self._total_requests * 100, 3) if self._total_requests > 0 else 0,
+            }
+            rend = {}
+            for name in sorted(self._by_rendition):
+                g = self._by_rendition[name]
+                h, m = g["hit"], g["miss"]
+                total = h.count + m.count
+                rend[name] = {
+                    "hit": h.to_dict(), "miss": m.to_dict(),
+                    "hit_rate": round(h.count / total * 100, 1) if total > 0 else 0,
+                    "total": total,
+                }
+            result["by_rendition"] = rend
+            codec = {}
+            for c in sorted(self._by_codec):
+                g = self._by_codec[c]
+                h, m = g["hit"], g["miss"]
+                total = h.count + m.count
+                codec[c] = {
+                    "hit": h.to_dict(), "miss": m.to_dict(),
+                    "hit_rate": round(h.count / total * 100, 1) if total > 0 else 0,
+                    "total": total,
+                }
+            result["by_codec"] = codec
+            # Reset while still holding lock
+            self._hit = _AggStats()
+            self._miss = _AggStats()
+            self._by_rendition.clear()
+            self._by_codec.clear()
+            self._total_requests = 0
+            self._error_count = 0
+            return result
 
 resp_tracker = ResponseTimeTracker()
 
@@ -492,6 +557,177 @@ period_tracker = PeriodTracker()
 
 
 # ---------------------------------------------------------------------------
+# Response Time Histogram: counts per latency bucket (m3u8 응답속도 분포)
+# ---------------------------------------------------------------------------
+class ResponseTimeHistogram:
+    """Cumulative latency distribution — resets on stats reset."""
+    BUCKETS = [500, 1000, 2000, 3000]   # ms upper bounds
+    LABELS  = ["≤500ms", "500ms-1s", "1s-2s", "2s-3s", "3s+"]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        n = len(self.BUCKETS) + 1
+        self._total  = [0] * n
+        self._hits   = [0] * n
+        self._misses = [0] * n
+
+    def record(self, ms: float, is_hit: bool):
+        idx = len(self.BUCKETS)
+        for i, thr in enumerate(self.BUCKETS):
+            if ms <= thr:
+                idx = i
+                break
+        with self._lock:
+            self._total[idx] += 1
+            if is_hit:
+                self._hits[idx] += 1
+            else:
+                self._misses[idx] += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "labels":  self.LABELS,
+                "total":   list(self._total),
+                "hits":    list(self._hits),
+                "misses":  list(self._misses),
+            }
+
+    def merge(self, snap: dict):
+        with self._lock:
+            for i, v in enumerate(snap.get("total",  [])):
+                if i < len(self._total):   self._total[i]  += v
+            for i, v in enumerate(snap.get("hits",   [])):
+                if i < len(self._hits):    self._hits[i]   += v
+            for i, v in enumerate(snap.get("misses", [])):
+                if i < len(self._misses):  self._misses[i] += v
+
+    def reset(self):
+        with self._lock:
+            n = len(self.BUCKETS) + 1
+            self._total  = [0] * n
+            self._hits   = [0] * n
+            self._misses = [0] * n
+
+resp_histogram = ResponseTimeHistogram()       # rendition m3u8 응답시간
+seg_histogram = ResponseTimeHistogram()        # segment HEAD 응답시간
+
+
+# ---------------------------------------------------------------------------
+# M3U8 응답시간 1초 버킷 히스토그램 (master / child 전용, 막대차트용)
+# "1초 이내, 1~2초, 2~3초, 3~4초, 4초+" 버킷 건수 집계
+# ---------------------------------------------------------------------------
+class SecondBucketHistogram:
+    BUCKETS = getattr(config, "RESP_BUCKETS_MS", [1000, 2000, 3000, 4000])
+    LABELS  = getattr(config, "RESP_BUCKET_LABELS", ["≤1s", "1~2s", "2~3s", "3~4s", "4s+"])
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        n = len(self.BUCKETS) + 1
+        self._ok  = [0] * n
+        self._err = [0] * n
+
+    def record(self, ms: float, is_error: bool = False):
+        idx = len(self.BUCKETS)
+        for i, thr in enumerate(self.BUCKETS):
+            if ms <= thr:
+                idx = i
+                break
+        with self._lock:
+            if is_error:
+                self._err[idx] += 1
+            else:
+                self._ok[idx] += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "labels": list(self.LABELS),
+                "ok":     list(self._ok),
+                "error":  list(self._err),
+                "total":  [o + e for o, e in zip(self._ok, self._err)],
+            }
+
+    def merge(self, snap: dict):
+        with self._lock:
+            for i, v in enumerate(snap.get("ok", [])):
+                if i < len(self._ok):  self._ok[i]  += v
+            for i, v in enumerate(snap.get("error", [])):
+                if i < len(self._err): self._err[i] += v
+
+    def reset(self):
+        with self._lock:
+            n = len(self.BUCKETS) + 1
+            self._ok  = [0] * n
+            self._err = [0] * n
+
+master_sec_hist = SecondBucketHistogram()   # master m3u8 1초버킷
+child_sec_hist  = SecondBucketHistogram()   # child(rendition) m3u8 1초버킷
+
+
+# ---------------------------------------------------------------------------
+# Master m3u8 latency tracker: sliding-window percentiles (p50/p95/p99)
+# SSAI 환경에서는 hit rate 지표가 무의미 → master 응답속도가 핵심 KPI
+# ---------------------------------------------------------------------------
+class MasterLatencyTracker:
+    def __init__(self, maxlen: int = 5000):
+        self._lock = threading.Lock()
+        self._samples = deque(maxlen=maxlen)
+        self._total = 0
+        self._error = 0
+
+    def record(self, ms: float, is_error: bool = False):
+        with self._lock:
+            self._total += 1
+            if is_error:
+                self._error += 1
+                return
+            self._samples.append(float(ms))
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            s = sorted(self._samples)
+            total = self._total
+            err = self._error
+        n = len(s)
+        if n == 0:
+            return {"total": total, "error_count": err,
+                    "error_rate": round(err / total * 100, 3) if total else 0,
+                    "count": 0, "p50": 0, "p95": 0, "p99": 0, "avg": 0, "min": 0, "max": 0}
+        def pct(p):
+            idx = min(n - 1, int(n * p))
+            return round(s[idx], 1)
+        return {
+            "total": total, "error_count": err,
+            "error_rate": round(err / total * 100, 3) if total else 0,
+            "count": n,
+            "p50": pct(0.50), "p95": pct(0.95), "p99": pct(0.99),
+            "avg": round(sum(s) / n, 1),
+            "min": round(s[0], 1), "max": round(s[-1], 1),
+        }
+
+    def snapshot_raw(self) -> dict:
+        with self._lock:
+            return {"samples": list(self._samples), "total": self._total, "error_count": self._error}
+
+    def merge(self, other: dict):
+        with self._lock:
+            for v in other.get("samples", []):
+                self._samples.append(float(v))
+            self._total += other.get("total", 0)
+            self._error += other.get("error_count", 0)
+
+    def reset(self):
+        with self._lock:
+            self._samples.clear()
+            self._total = 0
+            self._error = 0
+
+master_latency = MasterLatencyTracker()
+child_latency = MasterLatencyTracker()  # rendition(child) m3u8 p50/p95/p99
+
+
+# ---------------------------------------------------------------------------
 # Distributed mode: Worker → Master data sync
 # ---------------------------------------------------------------------------
 # Worker-local buffers (reset after each report)
@@ -507,23 +743,38 @@ def on_report_to_master(client_id, data):
         # cache_stats snapshot — deep copy then reset to avoid double-counting
         data["custom_cache_stats"] = {k: dict(v) for k, v in cache_stats.items()}
         cache_stats.clear()
-        # request_log recent entries
+        # H1+M5: request_log — only copy last 50 entries (master takes 50 anyway)
         with request_log_lock:
-            data["custom_request_log"] = list(request_log)[-200:]
-        # resp_tracker snapshot — send and reset to avoid unbounded memory growth
-        data["custom_resp"] = resp_tracker.snapshot()
-        resp_tracker.reset()
+            n = len(request_log)
+            start = max(0, n - 50)
+            data["custom_request_log"] = [request_log[i] for i in range(start, n)]
+        # H6: atomic snapshot+reset to avoid race window
+        data["custom_resp"] = resp_tracker.snapshot_and_reset()
         # origin_tracker snapshot
         data["custom_origin"] = origin_tracker.snapshot()
-        # collector (CacheMetricsCollector) cumulative — send and reset
+        # C3: reset cumulative only — preserve periodic stats for console reporter
         data["custom_collector"] = collector.snapshot_cumulative()
-        collector.reset()
+        collector.reset_cumulative()
         # throughput
         data["custom_throughput_bytes"] = throughput.get_total_bytes()
         # period tracker — snapshot_and_reset so worker accumulates fresh data each report
         data["custom_period"] = period_tracker.snapshot_and_reset(config.CACHE_REPORT_INTERVAL)
         # CF sampler data from SamplerUser (only the worker running SamplerUser has data)
         data["custom_cf_sampler"] = cf_sampler.get()
+        # response time histograms — snapshot+reset per report cycle
+        data["custom_histogram"] = resp_histogram.snapshot()
+        resp_histogram.reset()
+        data["custom_seg_histogram"] = seg_histogram.snapshot()
+        seg_histogram.reset()
+        data["custom_master_latency"] = master_latency.snapshot_raw()
+        master_latency.reset()
+        data["custom_child_latency"] = child_latency.snapshot_raw()
+        child_latency.reset()
+        # 1초 버킷 히스토그램 (master/child m3u8 응답분포)
+        data["custom_master_sec_hist"] = master_sec_hist.snapshot()
+        master_sec_hist.reset()
+        data["custom_child_sec_hist"] = child_sec_hist.snapshot()
+        child_sec_hist.reset()
         # reset tracking
         data["custom_reset_ts"] = _worker_reset_ts
 
@@ -535,6 +786,12 @@ _master_resp = None
 _master_origin_by_worker = {}   # client_id -> latest origin snapshot
 _master_collector = None
 _master_period_by_worker = {}  # client_id -> latest period snapshot
+_master_histogram = ResponseTimeHistogram()       # rendition 집계
+_master_seg_histogram = ResponseTimeHistogram()   # segment 집계
+_master_master_latency = MasterLatencyTracker()   # master m3u8 p50/p95/p99
+_master_child_latency = MasterLatencyTracker()    # child m3u8 p50/p95/p99
+_master_master_sec_hist = SecondBucketHistogram()  # master m3u8 1초버킷 집계
+_master_child_sec_hist  = SecondBucketHistogram()  # child m3u8 1초버킷 집계
 _master_lock = threading.Lock()
 _master_reset_ts = 0  # timestamp of last reset
 _worker_reset_ts = 0  # worker-side reset tracking
@@ -638,27 +895,49 @@ def on_worker_report(client_id, data):
         if wp and wp:
             _master_period_by_worker[client_id] = wp
 
-        # CF sampler — update master's cf_sampler if worker has non-zero data
+        # CF sampler — send raw values so master applies its own threshold + EMA
         wcs = data.get("custom_cf_sampler")
         if wcs:
-            if wcs.get("hit_ms", 0) > 0:
-                cf_sampler.record_hit(wcs["hit_ms"])
-            if wcs.get("miss_ms", 0) > 0:
-                cf_sampler.record_miss(wcs["miss_ms"])
+            if wcs.get("hit_raw", 0) > 0:
+                cf_sampler.record_hit(wcs["hit_raw"])
+            if wcs.get("miss_raw", 0) > 0:
+                cf_sampler.record_miss(wcs["miss_raw"])
+
+        # response time histograms merge
+        wh = data.get("custom_histogram")
+        if wh:
+            _master_histogram.merge(wh)
+        wsh = data.get("custom_seg_histogram")
+        if wsh:
+            _master_seg_histogram.merge(wsh)
+        wml = data.get("custom_master_latency")
+        if wml:
+            _master_master_latency.merge(wml)
+        wcl = data.get("custom_child_latency")
+        if wcl:
+            _master_child_latency.merge(wcl)
+        wmsh = data.get("custom_master_sec_hist")
+        if wmsh:
+            _master_master_sec_hist.merge(wmsh)
+        wcsh = data.get("custom_child_sec_hist")
+        if wcsh:
+            _master_child_sec_hist.merge(wcsh)
 
 
 _global_environment = None  # Set in on_init
+_is_master_cached = None    # M6: cached after first determination
 
 
 def _is_master():
-    """Check if current process is running as master.
-
-    Works with both --master mode and --processes mode.
-    """
+    """Check if current process is running as master (cached after first call)."""
+    global _is_master_cached
+    if _is_master_cached is not None:
+        return _is_master_cached
     if _global_environment and _global_environment.runner:
         from locust.runners import MasterRunner
-        return isinstance(_global_environment.runner, MasterRunner)
-    # Fallback: check argv or received worker data
+        _is_master_cached = isinstance(_global_environment.runner, MasterRunner)
+        return _is_master_cached
+    # Fallback: check argv or received worker data (not cached — transient state)
     return "--master" in __import__("sys").argv or bool(_master_cache_stats or _master_period_by_worker)
 
 
@@ -681,6 +960,34 @@ def _get_resp_snapshot():
     if _is_master() and _master_resp:
         return _master_resp
     return resp_tracker.snapshot()
+
+
+def _get_master_latency_snapshot():
+    """Return master m3u8 latency snapshot (percentiles)."""
+    if _is_master():
+        return _master_master_latency.snapshot()
+    return master_latency.snapshot()
+
+
+def _get_child_latency_snapshot():
+    """Return child m3u8 latency snapshot (percentiles)."""
+    if _is_master():
+        return _master_child_latency.snapshot()
+    return child_latency.snapshot()
+
+
+def _get_master_sec_hist_snapshot():
+    """Master m3u8 1초버킷 히스토그램."""
+    if _is_master():
+        return _master_master_sec_hist.snapshot()
+    return master_sec_hist.snapshot()
+
+
+def _get_child_sec_hist_snapshot():
+    """Child m3u8 1초버킷 히스토그램."""
+    if _is_master():
+        return _master_child_sec_hist.snapshot()
+    return child_sec_hist.snapshot()
 
 
 def _get_origin_snapshot():
@@ -746,6 +1053,20 @@ def _get_period_snapshot():
     return period_tracker.get_last_snapshot()
 
 
+def _get_histogram() -> dict:
+    """Return rendition m3u8 response time histogram from master or local."""
+    if _is_master():
+        return _master_histogram.snapshot()
+    return resp_histogram.snapshot()
+
+
+def _get_seg_histogram() -> dict:
+    """Return segment HEAD response time histogram from master or local."""
+    if _is_master():
+        return _master_seg_histogram.snapshot()
+    return seg_histogram.snapshot()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -756,22 +1077,6 @@ def _hdr(v):
     if isinstance(v, tuple):
         return v[1]
     return v
-
-
-def _norm_headers(headers):
-    """Normalize response headers to {lowercase_key: str_value} dict.
-
-    FastHttpUser (geventhttpclient) returns case-sensitive headers
-    (e.g. 'X-Cache' not 'x-cache'), while HttpUser (requests) is case-insensitive.
-    This function makes header access uniform for both.
-    """
-    out = {}
-    try:
-        for k, v in headers.items():
-            out[str(k).lower()] = str(_hdr(v))
-    except Exception:
-        pass
-    return out
 
 
 # Headers we care about — try common casings to avoid full iteration
@@ -802,13 +1107,13 @@ def _get_hdr(headers, key):
     return None
 
 
-# Request log sampling — only log every Nth request to reduce CPU
-_req_counter = 0
-_req_counter_lock = threading.Lock()
-LOG_SAMPLE_RATE = 10  # log 1 in 10 requests
+# M1: Probabilistic sampling — no lock needed (was _req_counter_lock)
+# 소규모(<1K CCU): 10, 대규모(50K+): 100 권장
+LOG_SAMPLE_RATE = 10
 
 
 def _relative_path(url: str) -> str:
+    """Used only in non-hot paths (sampler, segment fetch). Hot path uses _BASE_PATH."""
     parsed = urlparse(url)
     path = parsed.path
     if parsed.query:
@@ -827,147 +1132,347 @@ def _format_bytes(b):
 
 
 def _pick_rendition():
-    """Weighted random selection of a rendition."""
-    return random.choices(config.RENDITIONS, weights=config.RENDITION_WEIGHTS, k=1)[0]
+    """Weighted random selection via bisect (avoids random.choices list alloc)."""
+    return config.RENDITIONS[bisect.bisect_right(_CUM_WEIGHTS, random.random() * _TOTAL_WEIGHT)]
 
 
 # ---------------------------------------------------------------------------
 # User classes
 # ---------------------------------------------------------------------------
-def _watch_stream(user):
-    """Common HLS streaming logic with weighted rendition selection.
-    Tracks response metrics directly (moved from on_request for performance).
+
+# Regex to extract rendition index — handles both:
+#   SSAI/MediaTailor:    .../3.m3u8       → "/3.m3u8"
+#   MediaPackage direct: playlist_3.m3u8  → "playlist_3.m3u8"
+_MT_REND_RE = re.compile(r'(?:playlist_|/)(\d+)\.m3u8')
+
+
+def _fetch_session(user):
+    """Fetch master playlist from sogne-live → parse MediaTailor rendition URLs.
+    Cached on user instance, refreshed every SESSION_REFRESH_INTERVAL seconds.
     """
-    global _req_counter
-    pfx = f"[{user.user_type}]"
-
-    # 1. Pick rendition by weight
-    rendition = _pick_rendition()
-    rend_name = rendition["name"]
-    rend_label = rendition.get("label", rend_name)
-    codec = rendition["codec"]
-
-    # 2. Build variant playlist URL directly (skip master playlist)
-    variant_url = f"{config.BASE_URL}/{rend_name}.m3u8"
-    if getattr(user, "time_delay", None) is not None:
-        sep = "&" if "?" in variant_url else "?"
-        variant_url += f"{sep}aws.manifestsettings=time_delay:{user.time_delay}"
-
-    # 3. Fetch variant (media) playlist
+    now = time.time()
+    # Return cached session if still fresh
+    # TimeMachine은 매 요청마다 minus가 달라지므로 캐시 안 함
+    cached = getattr(user, "_session_urls", None)
+    cached_ts = getattr(user, "_session_ts", 0)
     td = getattr(user, "time_delay", None)
+    if td is None and cached and (now - cached_ts) < config.SESSION_REFRESH_INTERVAL:
+        return cached  # Live만 세션 캐시 (minus 없으니 OK)
+
+    qs_parts = []
+    if config.AUTH_TOKEN:
+        qs_parts.append(f"token={config.AUTH_TOKEN}")
+    if td is not None:
+        if config.TM_PARAM_MODE == "minus":
+            qs_parts.append(f"minus={td}")
+        else:
+            qs_parts.append(f"aws.manifestsettings=time_delay:{td}")
+    qs = "&".join(qs_parts)
+
+    master_path = f"{_BASE_PATH}/playlist.m3u8"
+    if qs:
+        master_path += f"?{qs}"
+
     t0 = time.time()
     with user.client.get(
-        _relative_path(variant_url),
-        name=f"{pfx} {rend_label}",
-        context={"full_url": variant_url, "rendition": rend_label, "codec": codec, "time_delay": td},
+        master_path,
+        name=f"[{user.user_type}] master",
         catch_response=True,
+        headers=_DEFAULT_HEADERS if _DEFAULT_HEADERS else None,
     ) as resp:
-        if resp.status_code == 404:
-            resp.success()
-            return
-        elif resp.status_code != 200:
-            resp.failure(f"HTTP {resp.status_code}")
-            resp_tracker.record(0, False, rend_label, codec, is_error=True)
-            return
+        if resp.status_code != 200:
+            resp.failure(f"master HTTP {resp.status_code}")
+            _ms_err = (time.time() - t0) * 1000
+            master_latency.record(_ms_err, is_error=True)
+            master_sec_hist.record(_ms_err, is_error=True)
+            return cached  # fallback to old session
         resp.success()
+        body = resp.text or ""
 
-    # --- Inline tracking (no on_request overhead) ---
-    response_time_ms = round((time.time() - t0) * 1000, 1)
-    hdrs = getattr(resp, "headers", None)
-    x_cache = (_get_hdr(hdrs, "x-cache") or "").lower()
-    is_hit = "hit" in x_cache
-    is_error = resp.status_code >= 400
+        # Track master playlist metrics (sogne-live → CF 캐시 측정)
+        ms = (time.time() - t0) * 1000
+        # SSAI 환경에서는 hit rate 무의미 → p50/p95/p99 latency가 핵심 KPI
+        master_latency.record(ms, is_error=False)
+        master_sec_hist.record(ms, is_error=False)
+        hdrs = getattr(resp, "headers", None)
+        x_cache = (_get_hdr(hdrs, "x-cache") or "").lower()
+        is_hit = "hit" in x_cache
+        resp_len = len(getattr(resp, "content", b"") or b"")
+        # master는 collector만 기록 (대시보드 히트율/응답속도는 segment 기준)
+        collector.record(user.user_type, "master",
+                         _get_hdr(hdrs, "x-cache") or "",
+                         _get_hdr(hdrs, "age") or "",
+                         _get_hdr(hdrs, "x-amz-cf-pop") or "")
 
-    resp_tracker.record(response_time_ms, is_hit, rend_label, codec, is_error=is_error)
-    origin_tracker.record(not is_hit)
-    resp_length = getattr(resp, "_content_length", 0) or 0
-    period_tracker.record(is_hit, is_error, response_time_ms, resp_length, actual_ms=response_time_ms)
+    # Parse rendition URLs from master playlist
+    # Handles both absolute (SSAI/MediaTailor) and relative (MediaPackage direct) URLs
+    session = {}
+    _rend_base = config.BASE_URL.rstrip("/") + "/"
+    _token_qs = f"token={config.AUTH_TOKEN}" if config.AUTH_TOKEN else ""
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Resolve relative URL → absolute
+        # MediaPackage already embeds TM params (aws.manifestsettings) in relative URLs,
+        # so only add token if not present
+        if not line.startswith("http"):
+            line = _rend_base + line
+            if _token_qs and "token=" not in line:
+                sep = "&" if "?" in line else "?"
+                line += sep + _token_qs
+        m = _MT_REND_RE.search(line)
+        if m:
+            rend_idx = m.group(1)  # "3" from "playlist_3.m3u8" or ".../3.m3u8"
+            session[rend_idx] = line
 
-    # Collector (cache metrics for dashboard)
-    collector.record(user.user_type, "variant", {
-        "x-cache": _get_hdr(hdrs, "x-cache") or "",
-        "age": _get_hdr(hdrs, "age") or "",
-        "x-amz-cf-pop": _get_hdr(hdrs, "x-amz-cf-pop") or "",
-    })
+    if session:
+        user._session_urls = session
+        user._session_ts = now
+    return session or cached
 
-    # --- Sampled: request_log + PDT (every Nth request) ---
-    with _req_counter_lock:
-        _req_counter += 1
-        _should_log = (_req_counter % LOG_SAMPLE_RATE == 0)
-    if _should_log:
-        age_str = _get_hdr(hdrs, "age") or "-"
-        pop = _get_hdr(hdrs, "x-amz-cf-pop") or "-"
 
-        pdt_info = None
-        try:
-            resp_text = resp.text or ""
-            if resp_text:
-                pdt_matches = _PDT_RE.findall(resp_text)
-                if pdt_matches:
-                    pdt_iso = pdt_matches[-1]
-                    pdt_dt = datetime.fromisoformat(pdt_iso.replace("Z", "+00:00"))
-                    diff_sec = round((datetime.now(timezone.utc) - pdt_dt).total_seconds() - 2.0, 1)
-                    if td is not None:
-                        pdt_info = {"pdt": pdt_iso, "diff_sec": diff_sec, "tm_accuracy": round(diff_sec - td, 1)}
-                    else:
-                        pdt_info = {"pdt": pdt_iso, "diff_sec": diff_sec, "live_latency": diff_sec}
-        except Exception:
-            pass
 
-        _p = urlparse(variant_url)
-        url = _p.path + ("?" + _p.query if _p.query else "")
+# (_track_response removed — segment tracking is inline in _watch_stream)
 
-        with request_log_lock:
-            request_log.append({
-                "ts": time.strftime("%H:%M:%S"),
-                "name": f"{pfx} {rend_label}",
-                "url": url,
-                "status": resp.status_code,
-                "size": f"{resp_length} B" if resp_length < 1024 else f"{resp_length / 1024:.1f} KB",
-                "size_bytes": resp_length,
-                "cf_cache": _get_hdr(hdrs, "x-cache") or "-",
-                "cf_pop": pop,
-                "cf_age": age_str,
-                "cache_control": _get_hdr(hdrs, "cache-control") or "-",
-                "via": _get_hdr(hdrs, "via") or "-",
-                "origin_id": _get_hdr(hdrs, "x-amzn-requestid") or _get_hdr(hdrs, "x-mediapackage-request-id") or "-",
-                "latency_ms": response_time_ms,
-                "actual_ms": response_time_ms,
-                "overhead_ms": 0.0,
-                "pdt": pdt_info.get("pdt", "-") if pdt_info else "-",
-                "pdt_diff": pdt_info.get("diff_sec") if pdt_info else None,
-                "tm_accuracy": pdt_info.get("tm_accuracy") if pdt_info else None,
-                "live_latency": pdt_info.get("live_latency") if pdt_info else None,
-            })
 
-    # 4. Fetch segments
-    if config.FETCH_SEGMENTS:
-        segments, _ = parse_media_playlist(resp.text, variant_url)
-        for seg_url in segments[-config.MAX_SEGMENTS_PER_CYCLE:]:
-            resp = user.client.get(
-                _relative_path(seg_url),
-                name=f"{pfx} segment",
-                context={"full_url": seg_url, "rendition": rend_label, "codec": codec},
+_user_id_counter = 0
+
+def _watch_stream(user):
+    """B mode: master playlist (sogne-live) → rendition playlist (MediaTailor)."""
+    global _user_id_counter
+    # 유저별 고유 ID 부여
+    if not hasattr(user, "_uid"):
+        _user_id_counter += 1
+        user._uid = _user_id_counter
+
+    td = getattr(user, "time_delay", None)
+
+    # 1. Get session (master playlist → MediaTailor rendition URLs)
+    session = _fetch_session(user)
+    if not session:
+        return  # master failed, skip
+
+    # 2. Pick rendition
+    rendition = _pick_rendition()
+    rend_name = rendition["name"]  # "2", "3", "4", ...
+    rend_label = _RENDITION_LABEL.get(rend_name, rend_name)
+    codec = _RENDITION_CODEC.get(rend_name, "AVC")
+    req_name = _NAME_CACHE.get((user.user_type, rend_name), f"[{user.user_type}] {rend_label}")
+
+    # 3. Get rendition URL from session
+    rend_url = session.get(rend_name)
+    if not rend_url:
+        # Fallback: pick any available rendition
+        rend_name = random.choice(list(session.keys()))
+        rend_url = session[rend_name]
+        rend_label = _RENDITION_LABEL.get(rend_name, rend_name)
+        codec = _RENDITION_CODEC.get(rend_name, "AVC")
+        req_name = f"[{user.user_type}] {rend_label}"
+
+    # TM 파라미터가 rendition URL에 없으면 명시적으로 추가
+    # (CF가 master cache key에서 aws.manifestsettings를 제외할 경우 live master가 캐시되어 TM 파라미터 없는 rendition URL이 반환될 수 있음)
+    if rend_url and td is not None:
+        if config.TM_PARAM_MODE == "aws" and "aws.manifestsettings" not in rend_url:
+            sep = "&" if "?" in rend_url else "?"
+            rend_url += f"{sep}aws.manifestsettings=time_delay:{td}"
+        elif config.TM_PARAM_MODE == "minus" and "minus=" not in rend_url:
+            sep = "&" if "?" in rend_url else "?"
+            rend_url += f"{sep}minus={td}"
+
+    # 4. Fetch rendition playlist — user별 Session으로 connection 재사용 (새 connection마다 SSL overhead 방지)
+    if not hasattr(user, "_rend_session"):
+        import requests as _requests
+        s = _requests.Session()
+        if _DEFAULT_HEADERS:
+            s.headers.update(_DEFAULT_HEADERS)
+        user._rend_session = s
+    t0 = time.time()
+    try:
+        mt_resp = user._rend_session.get(rend_url, timeout=(5, 10))
+        response_time_ms = (time.time() - t0) * 1000
+
+        # Report to Locust stats manually
+        if mt_resp.status_code == 200:
+            child_latency.record(response_time_ms, is_error=False)
+            child_sec_hist.record(response_time_ms, is_error=False)
+            events.request.fire(
+                request_type="GET", name=req_name,
+                response_time=response_time_ms,
+                response_length=len(mt_resp.content),
+                response=mt_resp, context={}, exception=None,
             )
-            if resp.status_code == 200:
-                _rh = resp.headers
-                collector.record(user.user_type, "segment", {
-                    "x-cache": _get_hdr(_rh, "x-cache") or "",
-                    "age": _get_hdr(_rh, "age") or "",
-                    "x-amz-cf-pop": _get_hdr(_rh, "x-amz-cf-pop") or "",
+        else:
+            child_latency.record(response_time_ms, is_error=True)
+            child_sec_hist.record(response_time_ms, is_error=True)
+            events.request.fire(
+                request_type="GET", name=req_name,
+                response_time=response_time_ms,
+                response_length=0,
+                response=mt_resp, context={},
+                exception=Exception(f"HTTP {mt_resp.status_code}"),
+            )
+            return
+
+        # Inline tracking — requests.Response.headers is case-insensitive
+        rh = mt_resp.headers
+        x_cache_raw = rh.get("X-Cache", "")
+        age_raw = rh.get("Age", "")
+        pop_raw = rh.get("X-Amz-Cf-Pop", "")
+        cache_control = rh.get("Cache-Control", "")
+        x_cache = x_cache_raw.lower()
+        is_hit = "hit" in x_cache
+        resp_length = len(mt_resp.content)
+
+        collector.record(user.user_type, "rendition", x_cache_raw, age_raw, pop_raw)
+        resp_histogram.record(response_time_ms, is_hit)
+        # 실시간 대시보드 RPS/응답속도: rendition 기준으로 피딩 (SEGMENT_CACHE_SAMPLE=0 대응)
+        resp_tracker.record(response_time_ms, is_hit, "rendition", codec, is_error=False)
+        origin_tracker.record(not is_hit)
+        period_tracker.record(is_hit, False, response_time_ms, resp_length, actual_ms=response_time_ms)
+
+        # 5. Segment CF cache sampling + rendition m3u8 메타데이터 로그
+        if mt_resp.status_code == 200:
+            body = mt_resp.text or ""
+            lines = body.splitlines()
+
+            # Parse m3u8 metadata
+            seg_files = []
+            pdts = []
+            media_seq = "-"
+            _seg_base = config.BASE_URL.rstrip("/") + "/"
+            _seg_qs = f"token={config.AUTH_TOKEN}" if config.AUTH_TOKEN else ""
+            for line in lines:
+                ls = line.strip()
+                if not ls or ls.startswith("#"):
+                    if ls.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                        pdts.append(ls.split(":", 1)[1])
+                    elif ls.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                        media_seq = ls.split(":")[1]
+                    continue
+                if ".mp4" in ls:
+                    if ls.startswith("http"):
+                        seg_files.append(ls)
+                    else:
+                        seg_url = _seg_base + ls.split("?")[0]
+                        if _seg_qs:
+                            seg_url += "?" + _seg_qs
+                        seg_files.append(seg_url)
+
+            # Segment CF cache HEAD sampling
+            _last_seg_xcache = "-"
+            _last_seg_pop = "-"
+            _last_seg_age = "-"
+            _last_seg_cc = "-"
+            seg_urls = seg_files
+            for seg_url in (seg_urls[-config.SEGMENT_CACHE_SAMPLE:] if config.SEGMENT_CACHE_SAMPLE > 0 else []):
+                try:
+                    st0 = time.time()
+                    seg_resp = _requests.head(seg_url, timeout=(3, 5),
+                                              headers=_DEFAULT_HEADERS if _DEFAULT_HEADERS else None)
+                    seg_ms = (time.time() - st0) * 1000
+                    seg_h = seg_resp.headers
+                    seg_xcache = seg_h.get("X-Cache", "")
+                    seg_age = seg_h.get("Age", "")
+                    seg_pop = seg_h.get("X-Amz-Cf-Pop", "")
+                    seg_is_hit = "hit" in seg_xcache.lower()
+
+                    seg_name = f"[{user.user_type}] segment"
+                    events.request.fire(
+                        request_type="HEAD", name=seg_name,
+                        response_time=seg_ms,
+                        response_length=int(seg_h.get("Content-Length", 0)),
+                        response=seg_resp, context={}, exception=None,
+                    )
+
+                    resp_tracker.record(seg_ms, seg_is_hit, "segment", codec, is_error=False)
+                    seg_histogram.record(seg_ms, seg_is_hit)
+                    origin_tracker.record(not seg_is_hit)
+                    period_tracker.record(seg_is_hit, False, seg_ms, 0, actual_ms=seg_ms)
+                    collector.record(user.user_type, "segment", seg_xcache, seg_age, seg_pop)
+
+                    # 로그용 segment CF 결과 저장
+                    _last_seg_xcache = seg_xcache or "-"
+                    _last_seg_pop = seg_pop or "-"
+                    _last_seg_age = seg_age or "-"
+                    _last_seg_cc = seg_h.get("Cache-Control", "-")
+                except Exception:
+                    pass
+
+            # 요청 로그: rendition m3u8 메타데이터 + segment CF 캐시 결과
+            first_seg = seg_files[0].rsplit("/", 1)[-1].split("?")[0] if seg_files else "-"
+            last_seg = seg_files[-1].rsplit("/", 1)[-1].split("?")[0] if seg_files else "-"
+            first_pdt = pdts[0] if pdts else "-"
+            last_pdt = pdts[-1] if pdts else "-"
+            # PDT diff (마지막 PDT ~ 현재)
+            # Live baseline: 마지막 PDT ~ 현재 차이에서 HLS 기본 지연 보정
+            # HLS live 지연 = ~3*target_duration + 패키징 ≈ 10-14초 → 별도 보정 없이 raw diff 표시
+            # TM accuracy = (diff - minus) → 0에 가까울수록 정확
+            # 단, diff 자체에 HLS 기본 지연(~12초)이 포함되므로 (diff - HLS지연 - minus)로 계산
+            pdt_info = None
+            try:
+                if pdts:
+                    pdt_dt = datetime.fromisoformat(pdts[-1].replace("Z", "+00:00"))
+                    raw_diff = (datetime.now(timezone.utc) - pdt_dt).total_seconds()
+                    # live_latency = raw_diff 그대로 (E2E 지연: 패키징+CF 포함 총 지연)
+                    # tm_accuracy = raw_diff - td → 0에 가까울수록 정확
+                    if td is not None:
+                        pdt_info = {"pdt": last_pdt, "diff_sec": round(raw_diff, 1), "tm_accuracy": round(raw_diff - td, 1)}
+                    else:
+                        pdt_info = {"pdt": last_pdt, "diff_sec": round(raw_diff, 1), "live_latency": round(raw_diff, 1)}
+            except Exception:
+                pass
+
+            # URL 표시: 유저ID + 마지막 세그먼트 + minus값
+            disp_url = f"U{user._uid} | {last_seg} | seq:{media_seq}"
+            if td is not None:
+                disp_url += f" | minus={td}"
+
+            with request_log_lock:
+                request_log.append({
+                    "ts": time.strftime("%H:%M:%S"),
+                    "name": req_name,
+                    "url": disp_url,
+                    "status": mt_resp.status_code,
+                    "size": f"{len(body)} B" if len(body) < 1024 else f"{len(body) / 1024:.1f} KB",
+                    "size_bytes": len(body),
+                    "cf_cache": x_cache_raw or "-",
+                    "cf_pop": pop_raw or "-",
+                    "cf_age": age_raw or "-",
+                    "cache_control": cache_control or "-",
+                    "via": rh.get("Via", "-"),
+                    "origin_id": rh.get("x-amzn-RequestId", "-"),
+                    "latency_ms": round(response_time_ms, 1),
+                    "actual_ms": round(response_time_ms, 1),
+                    "overhead_ms": 0.0,
+                    "pdt": pdt_info.get("pdt", "-") if pdt_info else first_pdt,
+                    "pdt_diff": pdt_info.get("diff_sec") if pdt_info else None,
+                    "tm_accuracy": pdt_info.get("tm_accuracy") if pdt_info else None,
+                    "live_latency": pdt_info.get("live_latency") if pdt_info else None,
                 })
+
+    except Exception as e:
+        response_time_ms = (time.time() - t0) * 1000
+        child_latency.record(response_time_ms, is_error=True)
+        child_sec_hist.record(response_time_ms, is_error=True)
+        events.request.fire(
+            request_type="GET", name=req_name,
+            response_time=response_time_ms,
+            response_length=0, response=None, context={},
+            exception=e,
+        )
 
     gevent.sleep(config.PLAYLIST_REFRESH_INTERVAL)
 
 
 class LiveUser(FastHttpUser):
     weight = config.LIVE_USER_WEIGHT
-    wait_time = constant_pacing(2)  # open workload: 전체 사이클 2초 유지
-    concurrency = 10                # connection pool size per user
+    wait_time = constant_pacing(1)  # open workload: 전체 사이클 1초 유지
+    concurrency = 1                 # C1: 1 conn/user (was 10 → 500K users = 5M conns!)
     max_retries = 0                 # 재시도 없음
     max_redirects = 0               # 리다이렉트 없음
-    connection_timeout = 30.0       # 연결 타임아웃 (기본 5s → 30s)
-    network_timeout = 30.0          # 읽기 타임아웃 (기본 5s → 30s)
+    connection_timeout = 5.0        # M2: CF connect < 100ms; 5s catches DNS issues
+    network_timeout = 10.0          # M2: manifest < 500ms; 10s catches slow origins
     user_type = "live"
     time_delay = None
 
@@ -978,12 +1483,12 @@ class LiveUser(FastHttpUser):
 
 class TimeMachineUser(FastHttpUser):
     weight = config.TIME_MACHINE_USER_WEIGHT
-    wait_time = constant_pacing(2)  # open workload: 전체 사이클 2초 유지
-    concurrency = 10                # connection pool size per user
+    wait_time = constant_pacing(1)  # open workload: 전체 사이클 1초 유지
+    concurrency = 1                 # C1: 1 conn/user
     max_retries = 0                 # 재시도 없음
     max_redirects = 0               # 리다이렉트 없음
-    connection_timeout = 30.0       # 연결 타임아웃
-    network_timeout = 30.0          # 읽기 타임아웃
+    connection_timeout = 5.0        # M2: CF connect timeout
+    network_timeout = 10.0          # M2: manifest read timeout
     user_type = "timemachine"
     time_delay = 1  # placeholder, randomized per request
 
@@ -1002,21 +1507,24 @@ class TimeMachineUser(FastHttpUser):
 # CF Latency Sampler User — shares Locust's connection pool
 # ---------------------------------------------------------------------------
 class SamplerUser(FastHttpUser):
-    """Dedicated user for CF latency sampling. fixed_count=1 → exactly 1 instance.
-    Shares FastHttpUser's connection pool with LiveUser/TimeMachineUser.
-    Results reported to cf_sampler (EMA smoothed).
-    """
+    """Dedicated user for CF latency sampling. fixed_count=1 → exactly 1 instance."""
     fixed_count = 1
     wait_time = constant(3)  # sample every 3 seconds
+    concurrency = 1           # C1: only 1 connection needed
     max_retries = 0
     max_redirects = 0
-    connection_timeout = 10.0
+    connection_timeout = 5.0
     network_timeout = 10.0
 
     @task
     def sample_latency(self):
+        rend = config.RENDITIONS[2]["name"]
+        token_qs = f"token={config.AUTH_TOKEN}" if config.AUTH_TOKEN else ""
+
         # HIT sample: TM URL with large time_delay (likely cached)
-        hit_path = f"{_relative_path(config.BASE_URL + '/' + config.RENDITIONS[2]['name'] + '.m3u8')}?aws.manifestsettings=time_delay:{config.TIME_DELAY_MAX // 2}"
+        tm_param = f"minus={config.TIME_DELAY_MAX // 2}" if config.TM_PARAM_MODE == "minus" else f"aws.manifestsettings=time_delay:{config.TIME_DELAY_MAX // 2}"
+        hit_qs = "&".join(filter(None, [token_qs, tm_param]))
+        hit_path = f"{_BASE_PATH}/{rend}.m3u8?{hit_qs}"
         t0 = time.time()
         try:
             with self.client.get(hit_path, name="[sampler] HIT", catch_response=True) as resp:
@@ -1029,8 +1537,10 @@ class SamplerUser(FastHttpUser):
         except Exception:
             pass
 
-        # MISS sample: live URL (max-age=1 → likely miss)
-        miss_path = _relative_path(config.BASE_URL + "/" + config.RENDITIONS[2]["name"] + ".m3u8")
+        # MISS sample: live URL (no TM param → likely miss)
+        miss_path = f"{_BASE_PATH}/{rend}.m3u8"
+        if token_qs:
+            miss_path += f"?{token_qs}"
         t1 = time.time()
         try:
             with self.client.get(miss_path, name="[sampler] MISS", catch_response=True) as resp:
@@ -1119,6 +1629,18 @@ def on_reset_stats():
     metrics_ts.reset()
     period_tracker.reset()
     cf_sampler.reset()
+    resp_histogram.reset()
+    _master_histogram.reset()
+    seg_histogram.reset()
+    _master_seg_histogram.reset()
+    master_latency.reset()
+    _master_master_latency.reset()
+    child_latency.reset()
+    _master_child_latency.reset()
+    master_sec_hist.reset()
+    _master_master_sec_hist.reset()
+    child_sec_hist.reset()
+    _master_child_sec_hist.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -1161,6 +1683,30 @@ def _evaluate_pass_fail():
     verdict = "PASS" if val <= c["pass"] else ("FAIL" if val > c["fail"] else "WARN")
     results.append({"id": "1-7", "label": c["label"], "value": f"{val}{c['unit']}", "pass": f"<={c['pass']}", "fail": f">{c['fail']}", "verdict": verdict})
 
+    # Master/Child m3u8 latency percentiles (SSAI 환경 핵심 KPI)
+    ml_snap = _get_master_latency_snapshot()
+    cl_snap = _get_child_latency_snapshot()
+    for layer, snap_lat, prefix, id_base in (
+        ("master", ml_snap, "master", "2"),
+        ("child",  cl_snap, "child",  "3"),
+    ):
+        for pct in ("p50", "p95", "p99"):
+            key = f"{prefix}_{pct}"
+            if key not in criteria:
+                continue
+            c = criteria[key]
+            val = snap_lat.get(pct, 0)
+            verdict = "PASS" if val <= c["pass"] else ("FAIL" if val > c["fail"] else "WARN")
+            # No data yet → show N/A without verdict
+            if snap_lat.get("count", 0) == 0:
+                verdict = "WARN"
+                val_disp = "N/A"
+            else:
+                val_disp = f"{val}{c['unit']}"
+            idx = {"p50": "1", "p95": "2", "p99": "3"}[pct]
+            results.append({"id": f"{id_base}-{idx}", "label": c["label"], "value": val_disp,
+                            "pass": f"<={c['pass']}", "fail": f">{c['fail']}", "verdict": verdict})
+
     # Origin Req/s flat check (MISS = origin request to MP/ML)
     origin_snap = _get_origin_snapshot()
     series = origin_snap.get("series", [])
@@ -1180,15 +1726,19 @@ def _evaluate_pass_fail():
 # Console cache reporter (greenlet)
 # ---------------------------------------------------------------------------
 def cache_reporter(environment):
-    # Avg cycle time: playlist_refresh(6s) + avg wait_time(2s) + request(~0.1s)
-    avg_cycle = config.PLAYLIST_REFRESH_INTERVAL + 2.0 + 0.1
+    # config.AVG_CYCLE_SEC: playlist_refresh + wait_time(pacing) + request overhead
+    avg_cycle = config.AVG_CYCLE_SEC
 
     while True:
         gevent.sleep(config.CACHE_REPORT_INTERVAL)
         # Snapshot period tracker (10s window)
         period_tracker.snapshot_and_reset(config.CACHE_REPORT_INTERVAL)
         snapshot = collector.snapshot_periodic()
-        lat_snap = _get_resp_snapshot()
+        # standalone 모드: resp_tracker가 worker report로 리셋되지 않으므로 직접 리셋
+        if not _is_master():
+            lat_snap = resp_tracker.snapshot_and_reset()
+        else:
+            lat_snap = _get_resp_snapshot()
         origin_snap = _get_origin_snapshot()
         tp_mbps = throughput.get_throughput_mbps()
 
@@ -1221,7 +1771,10 @@ def cache_reporter(environment):
             p_error_rate = lat_snap["error_rate"]
             p_throughput = tp_mbps
 
-        cf_lat = cf_sampler.get()
+        # Segment CF 응답속도 (resp_tracker 기준, cf_sampler 폴백)
+        _seg_snap = lat_snap  # 위에서 이미 snapshot_and_reset 했으므로 재활용
+        _seg_hit_ms = _seg_snap["hit"]["avg"] if _seg_snap["hit"]["count"] > 0 else cf_sampler.get().get("hit_ms", 0)
+        _seg_miss_ms = _seg_snap["miss"]["avg"] if _seg_snap["miss"]["count"] > 0 else cf_sampler.get().get("miss_ms", 0)
         # Per-interval call counts (not RPS)
         p_hit_count = period_snap.get("hits", 0) if period_snap else 0
         p_miss_count = period_snap.get("misses", 0) if period_snap else 0
@@ -1231,8 +1784,8 @@ def cache_reporter(environment):
             "hit_rate": p_hit_rate,
             "hit_avg": p_hit_avg,
             "miss_avg": p_miss_avg,
-            "cf_hit_ms": cf_lat["hit_ms"],
-            "cf_miss_ms": cf_lat["miss_ms"],
+            "cf_hit_ms": _seg_hit_ms,
+            "cf_miss_ms": _seg_miss_ms,
             "origin_rps": origin_snap["current_origin_rps"],
             "total_rps": p_rps,
             "error_rate": p_error_rate,
@@ -1298,7 +1851,7 @@ REQUEST_LOG_HTML = """<!DOCTYPE html>
   .controls button:disabled{opacity:.4;cursor:not-allowed}
   .controls .info{color:#64748b;font-size:.8rem;margin-left:auto}
   table{border-collapse:collapse;font-size:.8rem;white-space:nowrap}
-  th{text-align:left;padding:6px 8px;border-bottom:2px solid #334155;color:#94a3b8;font-weight:600;position:sticky;top:0;background:#0f172a;cursor:pointer;user-select:none;white-space:nowrap}
+  th{text-align:left;padding:6px 8px;border-bottom:2px solid #334155;color:#94a3b8;font-weight:600;position:sticky;top:0;background:#0f172a;cursor:pointer;user-select:none;white-space:nowrap;resize:horizontal;overflow:hidden}
   th:hover{color:#e2e8f0}
   th .sort-arrow{font-size:.7rem;margin-left:4px;color:#475569}
   th.sort-active .sort-arrow{color:#38bdf8}
@@ -1411,7 +1964,7 @@ function renderRows(entries){
     var pdt=fmtPdt(e);
     h+='<td>'+pdt.html+'</td>';
     h+='<td>'+e.cache_control+'</td></tr>';
-  });body.innerHTML=h||'<tr><td colspan="12" style="color:#64748b;text-align:center">요청 데이터 없음</td></tr>';
+  });body.innerHTML=h||'<tr><td colspan="11" style="color:#64748b;text-align:center">요청 데이터 없음</td></tr>';
 }
 function updateSortUI(){
   document.querySelectorAll('th[data-col]').forEach(th=>{
@@ -1518,6 +2071,35 @@ RATIO_PANEL_INJECT = """
       </div>
     </div>
     <div style="margin:10px 0 4px;border-top:1px solid #e0e0e0;padding-top:10px">
+      <div style="font-size:12px;color:#555;font-weight:600;margin-bottom:6px">스트림 URL 설정</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">Host</span>
+          <input type="text" id="rp-host" placeholder="https://your-host.com" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">Path</span>
+          <input type="text" id="rp-stream-path" placeholder="/out/v1/channel/vc12" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">HostHdr</span>
+          <input type="text" id="rp-host-header" placeholder="aws-kbo-smart-cloudfront.tving.com (빈칸이면 미사용)" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">Token</span>
+          <input type="text" id="rp-token" placeholder="JWT 토큰 (빈칸이면 토큰 없이 요청)" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">TM</span>
+          <select id="rp-tm-mode" style="padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:12px">
+            <option value="minus">minus=N (sogne)</option>
+            <option value="aws">aws.manifestsettings (MediaPackage)</option>
+          </select>
+        </div>
+        <div style="font-size:11px;color:#999" id="rp-url-preview">전체 URL: -</div>
+      </div>
+    </div>
+    <div style="margin:10px 0 4px;border-top:1px solid #e0e0e0;padding-top:10px">
       <div style="font-size:12px;color:#555;font-weight:600;margin-bottom:6px">Ramp-up 계산기</div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <input type="number" id="rp-calc-users" min="1" value="1000" style="width:80px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:13px" placeholder="사용자수">
@@ -1557,18 +2139,31 @@ RATIO_PANEL_INJECT = """
     function syncLocustToCalc(){var li=getLocustInputs();if(li.users&&li.rate){calcUsers.value=li.users.value;var rate=+li.rate.value;if(rate>0){var u=+li.users.value;var sec=Math.max(1,Math.ceil(u/rate));if(sec>=60&&sec%60===0){calcTime.value=sec/60;calcUnit.value='min';}else{calcTime.value=sec;calcUnit.value='sec';}updCalc();}}}
     calcUsers.oninput=updCalc;calcTime.oninput=updCalc;calcUnit.onchange=updCalc;
     setInterval(function(){var li=getLocustInputs();if(li.users){li.users.addEventListener('change',syncLocustToCalc);li.users.addEventListener('input',syncLocustToCalc);li.rate.addEventListener('change',syncLocustToCalc);li.rate.addEventListener('input',syncLocustToCalc);}},2000);
-    fetch('/weight-config').then(function(r){return r.json()}).then(function(d){ls.value=d.live_weight;ts.value=d.timemachine_weight;tdMin.value=d.time_delay_min||1;tdMax.value=d.time_delay_max||60;upd();updTd();syncLocustToCalc();}).catch(function(){});
+    var hostInput=document.getElementById('rp-host'),pathInput=document.getElementById('rp-stream-path'),urlPreview=document.getElementById('rp-url-preview');
+    var tokenInput=document.getElementById('rp-token'),tmModeSelect=document.getElementById('rp-tm-mode');
+    var hostHeaderInput=document.getElementById('rp-host-header');
+    function updUrlPreview(){var h=hostInput.value.replace(/\/+$/,''),p=pathInput.value;if(p&&!p.startsWith('/'))p='/'+p;var qs=[];if(tokenInput.value)qs.push('token=***');var mode=tmModeSelect.value;qs.push(mode==='minus'?'minus={N}':'aws.manifestsettings=time_delay:{N}');urlPreview.textContent='Live: '+(h||'(host)')+p+'/playlist_3.m3u8?'+qs[0]+' | TM: +'+qs[1];urlPreview.style.color=h?'#4caf50':'#999';}
+    hostInput.oninput=updUrlPreview;pathInput.oninput=updUrlPreview;tokenInput.oninput=updUrlPreview;tmModeSelect.onchange=updUrlPreview;
+    fetch('/weight-config').then(function(r){return r.json()}).then(function(d){ls.value=d.live_weight;ts.value=d.timemachine_weight;tdMin.value=d.time_delay_min||1;tdMax.value=d.time_delay_max||60;if(d.base_url){try{var u=new URL(d.base_url);hostInput.value=u.origin;pathInput.value=u.pathname;}catch(e){}}if(d.auth_token)tokenInput.value=d.auth_token;if(d.tm_param_mode)tmModeSelect.value=d.tm_param_mode;if(hostHeaderInput)hostHeaderInput.value=d.host_header||'';upd();updTd();updUrlPreview();syncLocustToCalc();}).catch(function(){});
     // Phase preset buttons
     document.querySelectorAll('#rp-panel .phase-btn').forEach(function(pb){
       pb.onclick=function(){ls.value=pb.dataset.live;ts.value=pb.dataset.tm;upd();};
     });
     btn.onclick=function(){btn.disabled=true;msg.className='rp-msg';msg.textContent='적용중...';
       syncCalcToLocust();
+      var payload={live_weight:+ls.value,timemachine_weight:+ts.value,time_delay_min:+tdMin.value,time_delay_max:+tdMax.value};
+      if(hostInput.value.trim())payload.host=hostInput.value.trim().replace(/\/+$/,'');
+      if(pathInput.value.trim())payload.stream_path=pathInput.value.trim();
+      payload.auth_token=tokenInput.value.trim();
+      payload.tm_param_mode=tmModeSelect.value;
+      if(hostHeaderInput)payload.host_header=hostHeaderInput.value.trim();
       fetch('/weight-config',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({live_weight:+ls.value,timemachine_weight:+ts.value,time_delay_min:+tdMin.value,time_delay_max:+tdMax.value})
+        body:JSON.stringify(payload)
       }).then(function(r){return r.json()}).then(function(d){msg.className='rp-msg';
-        msg.textContent='완료! 라이브='+d.live_weight+' TM='+d.timemachine_weight+' 딜레이:'+d.time_delay_min+'~'+d.time_delay_max+'초';
-        setTimeout(function(){msg.textContent='';},4000);
+        var urlMsg=d.url_changed?' | URL 변경됨':'';
+        msg.textContent='완료! L:'+d.live_weight+' T:'+d.timemachine_weight+' 딜레이:'+d.time_delay_min+'~'+d.time_delay_max+'초'+urlMsg;
+        if(d.base_url){var u=new URL(d.base_url);hostInput.value=u.origin;pathInput.value=u.pathname;updUrlPreview();}
+        setTimeout(function(){msg.textContent='';},5000);
       }).catch(function(){msg.className='rp-msg err';msg.textContent='실패';}).finally(function(){btn.disabled=false;});
     };
   }
@@ -1730,6 +2325,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c4','응답속도')">PNG</button><h3>4. HIT / MISS 응답속도 <small style="font-weight:400;color:#94a3b8">— HIT≤100ms PASS, MISS≤500ms PASS</small></h3><div style="height:200px"><canvas id="c4"></canvas></div></div>
     <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c5','에러율')">PNG</button><h3>5. 에러율 <small style="font-weight:400;color:#94a3b8">— 0.1%↓ PASS, 1%↑ FAIL. 4xx/5xx 모니터링</small></h3><div style="height:200px"><canvas id="c5"></canvas></div></div>
   </div>
+  <div class="chart-full"><button class="dl-btn" onclick="downloadChartPng('c8m','Master응답분포1초')">PNG</button><h3>6. Master m3u8 응답시간 분포 (1초 버킷) <small style="font-weight:400;color:#94a3b8">— master playlist 응답속도별 요청 건수</small></h3><div style="height:260px"><canvas id="c8m"></canvas></div></div>
+  <div class="chart-full"><button class="dl-btn" onclick="downloadChartPng('c8c','Child응답분포1초')">PNG</button><h3>7. Child m3u8 응답시간 분포 (1초 버킷) <small style="font-weight:400;color:#94a3b8">— rendition playlist 응답속도별 요청 건수</small></h3><div style="height:260px"><canvas id="c8c"></canvas></div></div>
 </div>
 <div id="tab-latency" class="tab-content"></div>
 <div id="tab-breakdown" class="tab-content"></div>
@@ -1767,7 +2364,7 @@ function setPhase(p){
     body:JSON.stringify({live_weight:pr.live,timemachine_weight:pr.tm,phase:p})
   }).then(r=>r.json()).then(()=>refresh()).catch(()=>{});
 }
-function rc(r){return r>=80?'high':r>=50?'mid':'low';}
+function rc(r){return r>=95?'high':r>=80?'mid':'low';}
 function vc(v){return v==='PASS'?'verdict-pass':v==='FAIL'?'verdict-fail':'verdict-warn';}
 var chartInstances={};
 var chartDarkTheme={grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10}}};
@@ -1839,15 +2436,8 @@ function renderLiveBar(rt){
   el.innerHTML=h;
 }
 function refresh(){
-  Promise.all([
-    fetch('/cache-stats').then(r=>r.json()),
-    fetch('/latency-stats').then(r=>r.json()),
-    fetch('/pass-fail').then(r=>r.json()),
-    fetch('/weight-config').then(r=>r.json()),
-    fetch('/origin-rps').then(r=>r.json()),
-    fetch('/metrics-ts?n=99999').then(r=>r.json()),
-    fetch('/realtime-stats').then(r=>r.json()),
-  ]).then(([cache,lat,pf,wc,origin,mts,rt])=>{
+  fetch('/dashboard-bundle?n=1800').then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(d=>{
+    var cache=d.cache,lat=d.latency,pf=d.pass_fail,wc=d.weight,origin=d.origin,mts=d.metrics_ts,rt=d.realtime;
     renderLiveBar(rt);
     var o=cache.overall;
     // Phase
@@ -1865,7 +2455,7 @@ function refresh(){
     // Tab: Charts — update data in-place (no flicker)
     if(!mts||mts.length===0){
       // No data — destroy existing charts
-      ['c1','c2','c3','c4','c5'].forEach(function(id){if(chartInstances[id]){chartInstances[id].destroy();delete chartInstances[id];}});
+      ['c1','c2','c3','c4','c5','c8m','c8c'].forEach(function(id){if(chartInstances[id]){chartInstances[id].destroy();delete chartInstances[id];}});
       var c1info=document.getElementById('c1info');if(c1info)c1info.innerHTML='<span style="color:#475569">데이터 수집중...</span>';
     }
     if(mts&&mts.length>0){
@@ -1887,9 +2477,9 @@ function refresh(){
       ]},options:{scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',min:0,max:100,title:{display:true,text:'히트율 %',color:'#4ade80'}},y1:{...chartDarkTheme,position:'right',min:0,title:{display:true,text:'미스율 %',color:'#f87171'},grid:{drawOnChartArea:false}}}}});
       var fmtNum=function(v){return v.toLocaleString();};
       makeChart('c3',{type:'line',data:{labels:tsL,datasets:[
-        {label:'CF MISS 호출수',data:mts.map(p=>p.miss_count||0),borderColor:'#fb923c',backgroundColor:'rgba(251,146,60,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
-        {label:'오리진 도달 호출수',data:mts.map(p=>Math.round(p.origin_rps||0)),borderColor:'#f87171',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0.3,yAxisID:'y1'}
-      ]},options:{plugins:{tooltip:{callbacks:{label:function(ctx){return ctx.dataset.label+': '+ctx.parsed.y.toLocaleString()+'건';}}},legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}}},scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',beginAtZero:true,title:{display:true,text:'CF MISS 호출수 (건)',color:'#fb923c'},ticks:{callback:fmtNum}},y1:{...chartDarkTheme,position:'right',beginAtZero:true,title:{display:true,text:'오리진 도달 호출수 (건)',color:'#f87171'},ticks:{callback:fmtNum},grid:{drawOnChartArea:false}}}}});
+        {label:'CF MISS 호출수 (구간)',data:mts.map(p=>p.miss_count||0),borderColor:'#fb923c',backgroundColor:'rgba(251,146,60,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
+        {label:'오리진 도달 RPS (/s)',data:mts.map(p=>p.origin_rps||0),borderColor:'#f87171',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0.3,yAxisID:'y1'}
+      ]},options:{plugins:{tooltip:{mode:'index',intersect:false,callbacks:{label:function(ctx){var v=ctx.parsed.y;var unit=ctx.datasetIndex===0?'건':'/s';return ctx.dataset.label+': '+v.toLocaleString()+unit;}}},legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}}},scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',beginAtZero:true,title:{display:true,text:'CF MISS 호출수 (건/구간)',color:'#fb923c'},ticks:{callback:fmtNum}},y1:{...chartDarkTheme,position:'right',beginAtZero:true,title:{display:true,text:'오리진 도달 RPS (/s)',color:'#f87171'},ticks:{callback:fmtNum},grid:{drawOnChartArea:false}}}}});
       makeChart('c4',{type:'line',data:{labels:tsL,datasets:[
         {label:'CF HIT',data:mts.map(p=>p.cf_hit_ms||0),borderColor:'#4ade80',borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
         {label:'CF MISS',data:mts.map(p=>p.cf_miss_ms||0),borderColor:'#f87171',borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y1'},
@@ -1902,9 +2492,43 @@ function refresh(){
         {label:'위험선 1.0%',data:mts.map(()=>1.0),borderColor:'#f87171',borderDash:[6,3],borderWidth:1,pointRadius:0}
       ]},options:{scales:{x:chartDarkTheme,y:{...chartDarkTheme,beginAtZero:true,title:{display:true,text:'에러율 %',color:'#facc15'}}}}});
     }
+    // master/child m3u8 1초버킷 막대차트 (ok/error 스택)
+    var renderSecHist=function(canvasId,hist,barColor){
+      if(!hist||!hist.labels||!hist.labels.length){if(chartInstances[canvasId]){chartInstances[canvasId].destroy();delete chartInstances[canvasId];}return;}
+      makeChart(canvasId,{type:'bar',data:{labels:hist.labels,datasets:[
+        {label:'성공',data:hist.ok||[],backgroundColor:barColor||'rgba(56,189,248,0.80)',borderColor:'#38bdf8',borderWidth:1,stack:'s'},
+        {label:'에러',data:hist.error||[],backgroundColor:'rgba(248,113,113,0.75)',borderColor:'#f87171',borderWidth:1,stack:'s'}
+      ]},options:{
+        plugins:{
+          tooltip:{mode:'index',intersect:false,callbacks:{label:function(ctx){return ctx.dataset.label+': '+(ctx.parsed.y||0).toLocaleString()+'건';},footer:function(items){var t=0;items.forEach(function(it){t+=(it.parsed.y||0);});return '합계: '+t.toLocaleString()+'건';}}},
+          legend:{display:true,labels:{color:'#94a3b8',boxWidth:10,padding:8,font:{size:11}}}
+        },
+        scales:{
+          x:{...chartDarkTheme,title:{display:true,text:'응답시간 버킷',color:'#94a3b8'}},
+          y:{...chartDarkTheme,beginAtZero:true,stacked:true,title:{display:true,text:'요청 건수',color:'#94a3b8'},ticks:{callback:function(v){return v.toLocaleString();}}}
+        }
+      }});
+    };
+    renderSecHist('c8m', d.master_sec_hist, 'rgba(250,204,21,0.80)');
+    renderSecHist('c8c', d.child_sec_hist,  'rgba(56,189,248,0.80)');
 
     // Tab: Latency & Judgment
-    var lt='<div class="latency-grid">';
+    var lt='';
+    // Master/Child m3u8 percentile summary (SSAI 핵심 KPI)
+    var ml=d.master_latency||{},cl=d.child_latency||{};
+    var ppc=function(v,p,f){if(v<=0)return '';return v<=p?'color:#4ade80':(v>f?'color:#f87171':'color:#facc15');};
+    lt+='<div class="section"><h2>M3U8 응답속도 백분위 (SSAI 핵심 KPI)</h2><table><tr><th>레이어</th><th>샘플수</th><th>p50</th><th>p95</th><th>p99</th><th>avg</th><th>max</th><th>에러율</th></tr>';
+    [['Master',ml],['Child',cl]].forEach(function(pair){
+      var nm=pair[0],s=pair[1]||{};
+      lt+='<tr><td><b>'+nm+' m3u8</b></td><td>'+(s.count||0).toLocaleString()+'</td>'
+        +'<td style="'+ppc(s.p50||0,150,500)+'">'+(s.p50||0)+' ms</td>'
+        +'<td style="'+ppc(s.p95||0,400,1000)+'">'+(s.p95||0)+' ms</td>'
+        +'<td style="'+ppc(s.p99||0,800,2000)+'">'+(s.p99||0)+' ms</td>'
+        +'<td>'+(s.avg||0)+' ms</td><td>'+(s.max||0)+' ms</td>'
+        +'<td>'+(s.error_rate||0)+'%</td></tr>';
+    });
+    lt+='</table></div>';
+    lt+='<div class="latency-grid">';
     var cfA2=rt&&rt.cf_actual?rt.cf_actual:{};
     lt+='<div class="lat-box"><h3 class="hit">HIT 응답속도</h3>';
     lt+='<div class="lat-row"><span>CF 실제</span><span class="lat-val" style="color:#4ade80;font-size:1.1rem">'+(cfA2.hit_ms||'-')+' ms</span></div>';
@@ -1939,15 +2563,34 @@ function refresh(){
     }
     if(!bk)bk='<div class="no-data">데이터 없음</div>';
     document.getElementById('tab-breakdown').innerHTML=bk;
-  }).catch(()=>{});
+  }).catch(e=>{
+    console.warn('[dashboard] bundle failed, trying individual fetches:',e);
+    Promise.all([
+      fetch('/cache-stats').then(r=>r.json()),
+      fetch('/latency-stats').then(r=>r.json()),
+      fetch('/pass-fail').then(r=>r.json()),
+      fetch('/weight-config').then(r=>r.json()),
+      fetch('/origin-rps').then(r=>r.json()),
+      fetch('/metrics-ts?n=1800').then(r=>r.json()),
+      fetch('/realtime-stats').then(r=>r.json()),
+    ]).then(function([cache,lat,pf,wc,origin,mts,rt]){
+      renderLiveBar(rt);
+      var o=cache.overall;
+      document.getElementById('phaseInfo').textContent=(wc.phase||'-')+' L:'+wc.live_weight+' T:'+wc.timemachine_weight;
+      document.querySelectorAll('.phase-bar .pb').forEach(b=>b.classList.toggle('active',b.textContent.includes(wc.phase||'---')));
+      var cards='';
+      cards+='<div class="card"><div class="label">히트율</div><div class="value rate '+rc(o.hit_rate)+'">'+o.hit_rate+'%</div><div class="sub">'+(o.hits||0).toLocaleString()+' / '+(o.total||0).toLocaleString()+'</div></div>';
+      var cfA=rt&&rt.cf_actual?rt.cf_actual:{};var cfH=cfA.hit_ms||'-';var cfM=cfA.miss_ms||'-';
+      cards+='<div class="card"><div class="label">응답속도</div><div class="value" style="font-size:1.1rem"><span class="hit">'+cfH+'</span> / <span class="miss">'+cfM+'</span></div><div class="sub">CF실제 HIT / MISS ms</div></div>';
+      cards+='<div class="card"><div class="label">총 요청수</div><div class="value" style="font-size:1.2rem">'+(o.total||0).toLocaleString()+'</div><div class="sub">평균 수명: '+o.avg_age+'초 | POP: '+o.top_pop+'</div></div>';
+      cards+='<div class="card"><div class="label">오리진 / 에러</div><div class="value" style="font-size:1.1rem"><span style="color:'+(origin.current_origin_rps<5?'#4ade80':'#f87171')+'">'+origin.current_origin_rps+'/s</span> <span style="color:'+(lat.error_rate<0.1?'#4ade80':'#f87171')+'">'+lat.error_rate+'%</span></div><div class="sub">오리진 요청/초 | 에러율</div></div>';
+      document.getElementById('topCards').innerHTML=cards;
+    }).catch(e2=>{console.error('[dashboard] fallback also failed:',e2);});
+  });
 }
 function downloadSnapshot(){
-  Promise.all([
-    fetch('/cache-stats').then(r=>r.json()),fetch('/latency-stats').then(r=>r.json()),
-    fetch('/pass-fail').then(r=>r.json()),fetch('/origin-rps').then(r=>r.json()),
-    fetch('/weight-config').then(r=>r.json()),
-    fetch('/metrics-ts?n=9999').then(r=>r.json()),
-  ]).then(([cache,lat,pf,origin,wc,mts])=>{
+  fetch('/dashboard-bundle?n=1800').then(r=>r.json()).then(d=>{
+    var cache=d.cache,lat=d.latency,pf=d.pass_fail,origin=d.origin,wc=d.weight,mts=d.metrics_ts;
     var snap={meta:{phase:wc.phase,live:wc.live_weight,tm:wc.timemachine_weight,time:new Date().toISOString()},cache:cache,latency:lat,pass_fail:pf,origin:origin,timeseries:mts};
     var blob=new Blob([JSON.stringify(snap,null,2)],{type:'application/json'});
     var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='snapshot_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';a.click();
@@ -1968,8 +2611,25 @@ refresh();setInterval(refresh,3000);
 # ---------------------------------------------------------------------------
 @events.init.add_listener
 def on_init(environment, **kwargs):
-    global _global_environment
+    global _global_environment, _BASE_PATH
     _global_environment = environment
+
+    # Locust --host가 주어지면 BASE_URL 자동 동기화
+    # 사용법: locust --host https://new-cf.cloudfront.net
+    #   + STREAM_PATH=/out/v1/new-channel/vc12 (환경변수)
+    #   또는 BASE_URL 전체 지정
+    if environment.host:
+        host = environment.host.rstrip("/")
+        # --host가 config.BASE_URL의 호스트와 다르면 갱신
+        from urllib.parse import urlparse as _up
+        current_host = f"{_up(config.BASE_URL).scheme}://{_up(config.BASE_URL).netloc}"
+        if host != current_host:
+            config.BASE_URL = f"{host}{config.STREAM_PATH}"
+            config.BASE_PLAYLIST_URL = f"{config.BASE_URL}/playlist.m3u8"
+            _BASE_PATH = config.STREAM_PATH
+            print(f"  [config] BASE_URL updated: {config.BASE_URL}")
+            print(f"  [config] STREAM_PATH: {config.STREAM_PATH}")
+
     if not environment.web_ui:
         return
 
@@ -2003,7 +2663,10 @@ def on_init(environment, **kwargs):
                 data = response.get_json()
                 log_data = _get_request_log_data()
                 with request_log_lock:
-                    url_data = list(reversed(log_data))[:100]
+                    # M7: take last 100 directly (avoid full deque→list→reverse)
+                    n = len(log_data)
+                    start = max(0, n - 100)
+                    url_data = [log_data[i] for i in range(n - 1, start - 1, -1)]
                 data["extended_stats"] = [
                     {"key": "cache-statistics", "data": _get_cache_table_data()},
                     {"key": "request-urls", "data": url_data},
@@ -2065,7 +2728,8 @@ def on_init(environment, **kwargs):
 
     @environment.web_ui.app.route("/metrics-ts")
     def metrics_ts_api():
-        last_n = int(flask_request.args.get("n", 120))
+        # H4: cap at 1800 points (30min @ 10s) to prevent 1-2MB JSON transfers
+        last_n = min(int(flask_request.args.get("n", 120)), 1800)
         return Response(_dumps(metrics_ts.get(last_n)), mimetype="application/json")
 
     @environment.web_ui.app.route("/realtime-stats")
@@ -2073,13 +2737,56 @@ def on_init(environment, **kwargs):
         data = _get_period_snapshot()
         # Add target RPS based on current user count
         user_count = environment.runner.user_count if environment.runner else 0
-        avg_cycle = config.PLAYLIST_REFRESH_INTERVAL + 2.0 + 0.1
+        avg_cycle = config.AVG_CYCLE_SEC
         if isinstance(data, dict):
             data["user_count"] = user_count
             data["target_rps"] = round(user_count / avg_cycle, 1) if avg_cycle > 0 else 0
             data["avg_cycle_sec"] = round(avg_cycle, 1)
-            data["cf_actual"] = cf_sampler.get()
+            # CF 응답속도: resp_tracker (segment HIT/MISS) 우선, CF Sampler 폴백
+            snap = _get_resp_snapshot()
+            cf_data = cf_sampler.get()
+            cf_data["hit_ms"] = snap["hit"]["avg"] if snap["hit"]["count"] > 0 else cf_data.get("hit_ms", 0)
+            cf_data["miss_ms"] = snap["miss"]["avg"] if snap["miss"]["count"] > 0 else cf_data.get("miss_ms", 0)
+            data["cf_actual"] = cf_data
         return Response(_dumps(data), mimetype="application/json")
+
+    # H3: Consolidated dashboard API — single fetch replaces 7 parallel fetches
+    @environment.web_ui.app.route("/dashboard-bundle")
+    def dashboard_bundle():
+        user_count = environment.runner.user_count if environment.runner else 0
+        avg_cycle = config.AVG_CYCLE_SEC
+        rt = _get_period_snapshot()
+        if isinstance(rt, dict):
+            rt["user_count"] = user_count
+            rt["target_rps"] = round(user_count / avg_cycle, 1) if avg_cycle > 0 else 0
+            rt["avg_cycle_sec"] = round(avg_cycle, 1)
+            snap = _get_resp_snapshot()
+            cf_data = cf_sampler.get()
+            cf_data["hit_ms"] = snap["hit"]["avg"] if snap["hit"]["count"] > 0 else cf_data.get("hit_ms", 0)
+            cf_data["miss_ms"] = snap["miss"]["avg"] if snap["miss"]["count"] > 0 else cf_data.get("miss_ms", 0)
+            rt["cf_actual"] = cf_data
+        bundle = {
+            "cache": _get_collector_snapshot(),
+            "latency": _get_resp_snapshot(),
+            "pass_fail": _evaluate_pass_fail(),
+            "weight": {
+                "live_weight": LiveUser.weight,
+                "timemachine_weight": TimeMachineUser.weight,
+                "phase": current_phase["name"],
+                "time_delay_min": config.TIME_DELAY_MIN,
+                "time_delay_max": config.TIME_DELAY_MAX,
+            },
+            "origin": _get_origin_snapshot(),
+            "metrics_ts": metrics_ts.get(min(int(flask_request.args.get("n", 1800)), 1800)),
+            "realtime": rt,
+            "histogram": _get_histogram(),
+            "seg_histogram": _get_seg_histogram(),
+            "master_latency": _get_master_latency_snapshot(),
+            "child_latency": _get_child_latency_snapshot(),
+            "master_sec_hist": _get_master_sec_hist_snapshot(),
+            "child_sec_hist": _get_child_sec_hist_snapshot(),
+        }
+        return Response(_dumps(bundle), mimetype="application/json")
 
     @environment.web_ui.app.route("/request-log")
     def request_log_api():
@@ -2088,17 +2795,31 @@ def on_init(environment, **kwargs):
         name_filter = flask_request.args.get("filter", "")
         cache_filter = flask_request.args.get("cache_filter", "")
         log_data = _get_request_log_data()
+        # M7: snapshot under lock, then process without lock
         with request_log_lock:
-            all_entries = list(reversed(log_data))
-        if name_filter:
-            all_entries = [e for e in all_entries if name_filter.lower() in (e["name"] + " " + e.get("url", "")).lower()]
-        if cache_filter:
-            all_entries = [e for e in all_entries if cache_filter.lower() in (e.get("cf_cache", "")).lower()]
-        total = len(all_entries)
-        total_pages = max(1, (total + per_page - 1) // per_page)
-        page = max(1, min(page, total_pages))
-        start = (page - 1) * per_page
-        return Response(_dumps({"entries": all_entries[start:start + per_page], "page": page, "per_page": per_page, "total": total, "total_pages": total_pages}), mimetype="application/json")
+            entries = list(log_data)
+        if not name_filter and not cache_filter:
+            # Fast path: direct slice from end (no reversed() copy)
+            total = len(entries)
+            total_pages = max(1, (total + per_page - 1) // per_page)
+            page = max(1, min(page, total_pages))
+            start_from_end = total - (page - 1) * per_page
+            end_from_end = max(0, start_from_end - per_page)
+            page_entries = entries[end_from_end:start_from_end]
+            page_entries.reverse()
+        else:
+            # Filtered path — iterate once with combined filter
+            nf = name_filter.lower() if name_filter else ""
+            cf = cache_filter.lower() if cache_filter else ""
+            filtered = [e for e in reversed(entries)
+                        if (not nf or nf in (e["name"] + " " + e.get("url", "")).lower())
+                        and (not cf or cf in e.get("cf_cache", "").lower())]
+            total = len(filtered)
+            total_pages = max(1, (total + per_page - 1) // per_page)
+            page = max(1, min(page, total_pages))
+            start = (page - 1) * per_page
+            page_entries = filtered[start:start + per_page]
+        return Response(_dumps({"entries": page_entries, "page": page, "per_page": per_page, "total": total, "total_pages": total_pages}), mimetype="application/json")
 
     @environment.web_ui.app.route("/request-log-export")
     def request_log_export():
@@ -2130,12 +2851,18 @@ def on_init(environment, **kwargs):
 
     @environment.web_ui.app.route("/weight-config", methods=["GET", "POST"])
     def weight_config():
+        global _BASE_PATH
         if flask_request.method == "GET":
             return Response(_dumps({
                 "live_weight": LiveUser.weight, "timemachine_weight": TimeMachineUser.weight,
                 "phase": current_phase["name"],
                 "time_delay_min": config.TIME_DELAY_MIN,
                 "time_delay_max": config.TIME_DELAY_MAX,
+                "base_url": config.BASE_URL,
+                "stream_path": config.STREAM_PATH,
+                "auth_token": config.AUTH_TOKEN,
+                "tm_param_mode": config.TM_PARAM_MODE,
+                "host_header": getattr(config, "HOST_HEADER", "") or "",
             }), mimetype="application/json")
 
         data = flask_request.get_json(force=True)
@@ -2150,6 +2877,42 @@ def on_init(environment, **kwargs):
             config.TIME_DELAY_MIN = max(1, int(data["time_delay_min"]))
         if "time_delay_max" in data:
             config.TIME_DELAY_MAX = max(config.TIME_DELAY_MIN, int(data["time_delay_max"]))
+
+        # Update auth token & TM param mode
+        if "auth_token" in data:
+            config.AUTH_TOKEN = data["auth_token"].strip()
+        if "tm_param_mode" in data and data["tm_param_mode"] in ("minus", "aws"):
+            config.TM_PARAM_MODE = data["tm_param_mode"]
+
+        # Update Host header override (CF → ALB 우회용)
+        if "host_header" in data:
+            new_hh = (data.get("host_header") or "").strip()
+            config.HOST_HEADER = new_hh
+            # 전역 헤더 dict 갱신 — 다음 요청부터 즉시 반영
+            global _DEFAULT_HEADERS
+            _DEFAULT_HEADERS = {"Host": new_hh} if new_hh else {}
+            print(f"  [config] Host header → {new_hh or '(none)'}")
+
+        # Update stream URL (host + path)
+        url_changed = False
+        new_host = data.get("host", "").strip().rstrip("/")
+        new_path = data.get("stream_path", "").strip()
+        if new_path and not new_path.startswith("/"):
+            new_path = "/" + new_path
+        if new_host or new_path:
+            if new_path:
+                config.STREAM_PATH = new_path
+            if new_host:
+                config.BASE_URL = f"{new_host}{config.STREAM_PATH}"
+            elif new_path:
+                # host 안 바꾸고 path만 바꾼 경우
+                from urllib.parse import urlparse as _up
+                parsed = _up(config.BASE_URL)
+                config.BASE_URL = f"{parsed.scheme}://{parsed.netloc}{config.STREAM_PATH}"
+            config.BASE_PLAYLIST_URL = f"{config.BASE_URL}/playlist.m3u8"
+            _BASE_PATH = config.STREAM_PATH
+            url_changed = True
+            print(f"  [config] URL changed → {config.BASE_URL}")
 
         # Update phase
         phase = data.get("phase", "")
@@ -2171,6 +2934,12 @@ def on_init(environment, **kwargs):
             "phase": current_phase["name"],
             "time_delay_min": config.TIME_DELAY_MIN,
             "time_delay_max": config.TIME_DELAY_MAX,
+            "base_url": config.BASE_URL,
+            "stream_path": config.STREAM_PATH,
+            "auth_token": config.AUTH_TOKEN,
+            "tm_param_mode": config.TM_PARAM_MODE,
+            "host_header": getattr(config, "HOST_HEADER", "") or "",
+            "url_changed": url_changed,
         }), mimetype="application/json")
 
     @environment.web_ui.app.route("/results")
@@ -2263,6 +3032,10 @@ def on_test_stop(environment, **kwargs):
         "latency": _get_resp_snapshot(),
         "pass_fail": _evaluate_pass_fail(),
         "origin": _get_origin_snapshot(),
+        "master_latency": _get_master_latency_snapshot(),
+        "child_latency": _get_child_latency_snapshot(),
+        "master_sec_hist": _get_master_sec_hist_snapshot(),
+        "child_sec_hist": _get_child_sec_hist_snapshot(),
         "throughput": {
             "total_bytes": throughput.get_total_bytes(),
             "total_formatted": _format_bytes(throughput.get_total_bytes()),
