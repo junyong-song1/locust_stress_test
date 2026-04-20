@@ -28,6 +28,7 @@ from locust.contrib.fasthttp import FastHttpUser
 import config
 from cache_metrics import CacheMetricsCollector
 from hls_client import parse_media_playlist
+from metrics import registry
 
 collector = CacheMetricsCollector()
 
@@ -1723,6 +1724,63 @@ def _evaluate_pass_fail():
 
 
 # ---------------------------------------------------------------------------
+# Metric Registry — 새 메트릭은 여기에 define() 한 줄만 추가하면 됩니다.
+#
+# 사용법:
+#   1) _watch_stream() 에서 tracker.record(value) 추가
+#   2) 아래에 registry.define(...) 추가
+#   → /metrics-schema, /metrics-data 자동 노출
+#   → group이 builtin(cache/latency/m3u8/realtime/system) 이 아닌 경우 대시보드에 자동 렌더링
+# ---------------------------------------------------------------------------
+_M3U8_THRESHOLDS = {
+    "p50": {"pass": 150, "fail": 500},
+    "p95": {"pass": 400, "fail": 1000},
+    "p99": {"pass": 800, "fail": 2000},
+}
+
+
+def _make_latency_source(getter, pct):
+    return lambda: getter().get(pct) if getter().get("count", 0) > 0 else None
+
+
+def _register_metrics():
+    registry.define(
+        key="cache_hit_rate", label="Segment Cache Hit Rate", unit="%",
+        source=lambda: _get_collector_snapshot()["overall"].get("hit_rate", 0.0),
+        pass_val=95.0, fail_val=80.0, render="gauge", group="cache",
+    )
+    registry.define(
+        key="cf_hit_ms", label="HIT avg 응답속도", unit="ms",
+        source=lambda: cf_sampler.get()["hit_ms"] or _get_resp_snapshot()["hit"]["avg"],
+        pass_val=100, fail_val=500, render="gauge", group="latency",
+        higher_is_better=False,
+    )
+    registry.define(
+        key="cf_miss_ms", label="MISS avg 응답속도", unit="ms",
+        source=lambda: cf_sampler.get()["miss_ms"] or _get_resp_snapshot()["miss"]["avg"],
+        pass_val=500, fail_val=2000, render="gauge", group="latency",
+        higher_is_better=False,
+    )
+    registry.define(
+        key="error_rate", label="에러율", unit="%",
+        source=lambda: _get_resp_snapshot()["error_rate"],
+        pass_val=0.1, fail_val=1.0, render="gauge", group="cache",
+        higher_is_better=False,
+    )
+    for layer, getter in [("master", _get_master_latency_snapshot), ("child", _get_child_latency_snapshot)]:
+        for pct, thr in _M3U8_THRESHOLDS.items():
+            registry.define(
+                key=f"{layer}_{pct}", label=f"{layer.capitalize()} {pct}", unit="ms",
+                source=_make_latency_source(getter, pct),
+                pass_val=thr["pass"], fail_val=thr["fail"],
+                render="percentile", group="m3u8", higher_is_better=False,
+            )
+
+
+_register_metrics()
+
+
+# ---------------------------------------------------------------------------
 # Console cache reporter (greenlet)
 # ---------------------------------------------------------------------------
 def cache_reporter(environment):
@@ -2681,7 +2739,7 @@ def on_init(environment, **kwargs):
             try:
                 html = response.get_data(as_text=True)
                 if "</body>" in html and "rp-panel" not in html:
-                    html = html.replace("</body>", RATIO_PANEL_INJECT + "</body>")
+                    html = html.replace("</body>", _serve_dashboard_file("ratio_panel.html", RATIO_PANEL_INJECT) + "</body>")
                     response.set_data(html)
             except Exception:
                 pass
@@ -2704,9 +2762,26 @@ def on_init(environment, **kwargs):
     def cache_stats_api():
         return Response(_dumps(_get_collector_snapshot()), mimetype="application/json")
 
+    @environment.web_ui.app.route("/metrics-schema")
+    def metrics_schema_api():
+        return Response(_dumps(registry.schema()), mimetype="application/json")
+
+    @environment.web_ui.app.route("/metrics-data")
+    def metrics_data_api():
+        return Response(_dumps(registry.snapshot()), mimetype="application/json")
+
+    def _serve_dashboard_file(filename, fallback):
+        import os as _os
+        fpath = _os.path.join(_os.path.dirname(__file__) or ".", "dashboard", filename)
+        try:
+            with open(fpath, encoding="utf-8") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return fallback
+
     @environment.web_ui.app.route("/cache-dashboard")
     def cache_dashboard():
-        return Response(DASHBOARD_HTML, mimetype="text/html")
+        return Response(_serve_dashboard_file("index.html", DASHBOARD_HTML), mimetype="text/html")
 
     @environment.web_ui.app.route("/throughput")
     def throughput_api():
@@ -2785,6 +2860,7 @@ def on_init(environment, **kwargs):
             "child_latency": _get_child_latency_snapshot(),
             "master_sec_hist": _get_master_sec_hist_snapshot(),
             "child_sec_hist": _get_child_sec_hist_snapshot(),
+            "metrics_flat": registry.snapshot(),
         }
         return Response(_dumps(bundle), mimetype="application/json")
 
@@ -2847,7 +2923,7 @@ def on_init(environment, **kwargs):
 
     @environment.web_ui.app.route("/request-log-view")
     def request_log_view():
-        return Response(REQUEST_LOG_HTML, mimetype="text/html")
+        return Response(_serve_dashboard_file("request_log.html", REQUEST_LOG_HTML), mimetype="text/html")
 
     @environment.web_ui.app.route("/weight-config", methods=["GET", "POST"])
     def weight_config():

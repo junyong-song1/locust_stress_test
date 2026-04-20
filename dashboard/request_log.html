@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>요청 URL 로그</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:10px;max-width:100%;margin:0 auto;min-height:100vh;display:flex;flex-direction:column}
+  h1{font-size:1.4rem;color:#38bdf8;margin-bottom:8px}
+  .top-nav{display:flex;gap:0;margin-bottom:10px;background:#1e293b;border-radius:8px;overflow:hidden;border:1px solid #334155}
+  .table-wrap{flex:1;overflow-y:auto;overflow-x:auto}
+  .top-nav a{color:#94a3b8;text-decoration:none;padding:10px 20px;font-size:.85rem;font-weight:600;transition:all .2s;border-right:1px solid #334155}
+  .top-nav a:last-child{border-right:none}
+  .top-nav a:hover{color:#e2e8f0;background:#334155}
+  .top-nav a.active{color:#38bdf8;background:#0f172a;border-bottom:2px solid #38bdf8}
+  .controls{display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .controls select,.controls input{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:4px;font-size:.85rem}
+  .controls input{width:200px}
+  .controls button{background:#334155;color:#e2e8f0;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:.85rem}
+  .controls button:hover{background:#475569}
+  .controls button:disabled{opacity:.4;cursor:not-allowed}
+  .controls .info{color:#64748b;font-size:.8rem;margin-left:auto}
+  table{border-collapse:collapse;font-size:.8rem;white-space:nowrap}
+  th{text-align:left;padding:6px 8px;border-bottom:2px solid #334155;color:#94a3b8;font-weight:600;position:sticky;top:0;background:#0f172a;cursor:pointer;user-select:none;white-space:nowrap;resize:horizontal;overflow:hidden}
+  th:hover{color:#e2e8f0}
+  th .sort-arrow{font-size:.7rem;margin-left:4px;color:#475569}
+  th.sort-active .sort-arrow{color:#38bdf8}
+  td{padding:5px 8px;border-bottom:1px solid #1e293b;white-space:nowrap}
+  tr:hover td{background:#1e293b}
+  .hit{color:#4ade80} .miss{color:#f87171} .refresh{color:#facc15}
+  .pager{display:flex;gap:8px;align-items:center;padding:8px 0;margin-top:auto}
+  .pager button{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:4px 12px;border-radius:4px;cursor:pointer}
+  .pager button:hover{background:#334155}
+  .pager button:disabled{opacity:.3;cursor:not-allowed}
+  .pager .page-info{color:#94a3b8;font-size:.85rem}
+  td.url-cell{cursor:pointer} td.url-cell:hover{color:#38bdf8;text-decoration:underline}
+  .legend{display:flex;gap:16px;margin-bottom:12px;font-size:.8rem;color:#94a3b8}
+  .legend span{display:flex;align-items:center;gap:4px}
+  .legend .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+</style>
+</head>
+<body>
+<nav class="top-nav">
+  <a href="/">Locust UI</a>
+  <a href="/cache-dashboard">캐시 대시보드</a>
+  <a href="/request-log-view" class="active">요청 로그</a>
+</nav>
+<h1>요청 URL 로그</h1>
+<div class="legend">
+  <span><span class="dot" style="background:#4ade80"></span> CF 히트</span>
+  <span><span class="dot" style="background:#f87171"></span> CF 미스</span>
+  <span><span class="dot" style="background:#facc15"></span> CF 리프레시히트</span>
+  <span>| CF = CloudFront 캐시 &nbsp; Cache-Control = 오리진(MediaPackage) 캐시 정책</span>
+</div>
+<div class="controls">
+  <select id="filterType">
+    <option value="">전체</option>
+    <option value="[live]">라이브만</option>
+    <option value="[timemachine]">타임머신만</option>
+    <option value="variant">변환 플레이리스트</option>
+    <option value="segment">세그먼트</option>
+  </select>
+  <select id="filterCache">
+    <option value="">CF 캐시 전체</option>
+    <option value="Hit">HIT만</option>
+    <option value="Miss">MISS만</option>
+    <option value="RefreshHit">RefreshHit만</option>
+  </select>
+  <input type="text" id="filterText" placeholder="URL 또는 이름 검색...">
+  <select id="perPage"><option value="50">50개/페이지</option><option value="100">100개/페이지</option><option value="200">200개/페이지</option></select>
+  <button id="refreshBtn">새로고침</button>
+  <button id="exportBtn" style="background:#0d9488;font-weight:600">Excel 다운로드</button>
+  <label style="font-size:.8rem;color:#94a3b8"><input type="checkbox" id="autoRefresh" checked> 자동 (3초)</label>
+  <span class="info" id="totalInfo"></span>
+</div>
+<div class="table-wrap">
+<table><thead><tr>
+  <th class="col-ts" data-col="ts" data-type="str">시간 <span class="sort-arrow"></span></th>
+  <th class="col-name" data-col="name" data-type="str">이름 <span class="sort-arrow"></span></th>
+  <th class="col-url" data-col="url" data-type="str">URL <span class="sort-arrow"></span></th>
+  <th class="col-status" data-col="status" data-type="num">상태 <span class="sort-arrow"></span></th>
+  <th class="col-actual" data-col="actual_ms" data-type="num">CF응답 <span class="sort-arrow"></span></th>
+  <th class="col-overhead" data-col="overhead_ms" data-type="num">지연 <span class="sort-arrow"></span></th>
+  <th class="col-size" data-col="size" data-type="num">크기 <span class="sort-arrow"></span></th>
+  <th class="col-cf-cache" data-col="cf_cache" data-type="str">CF 캐시 <span class="sort-arrow"></span></th>
+  <th class="col-cf-pop" data-col="cf_pop" data-type="str">CF POP <span class="sort-arrow"></span></th>
+  <th class="col-pdt" data-col="pdt_diff" data-type="num">PDT(KST) <span class="sort-arrow"></span></th>
+  <th class="col-cc" data-col="cache_control" data-type="str">캐시정책 <span class="sort-arrow"></span></th>
+</tr></thead><tbody id="logBody"></tbody></table>
+</div>
+<div class="pager">
+  <button id="prevBtn">&larr; 이전</button>
+  <span class="page-info" id="pageInfo">-</span>
+  <button id="nextBtn">다음 &rarr;</button>
+</div>
+<script>
+let page=1, totalPages=1, sortCol='', sortDir='';
+let lastData=[];
+const body=document.getElementById('logBody'),filterType=document.getElementById('filterType'),
+  filterText=document.getElementById('filterText'),perPage=document.getElementById('perPage'),
+  prevBtn=document.getElementById('prevBtn'),nextBtn=document.getElementById('nextBtn'),
+  pageInfo=document.getElementById('pageInfo'),totalInfo=document.getElementById('totalInfo'),
+  autoCheck=document.getElementById('autoRefresh'),
+  filterCache=document.getElementById('filterCache');
+function cacheClass(v){v=(v||'').toLowerCase();if(v.includes('hit')&&!v.includes('miss'))return v.includes('refresh')?'refresh':'hit';if(v.includes('miss'))return 'miss';return '';}
+function parseNum(v){if(v==null||v==='-'||v==='')return -1;const n=parseFloat(String(v).replace(/[^0-9.\-]/g,''));return isNaN(n)?-1:n;}
+function sortData(data){
+  if(!sortCol)return data;
+  const th=document.querySelector('th[data-col="'+sortCol+'"]');
+  const isNum=th&&th.dataset.type==='num';
+  return [...data].sort((a,b)=>{
+    let va=a[sortCol]||'',vb=b[sortCol]||'';
+    if(isNum){va=parseNum(va);vb=parseNum(vb);}else{va=String(va).toLowerCase();vb=String(vb).toLowerCase();}
+    if(va<vb)return sortDir==='asc'?-1:1;if(va>vb)return sortDir==='asc'?1:-1;return 0;
+  });
+}
+function fmtSec(s){if(s==null||s==='-'||s==='')return'-';var n=parseFloat(s);if(isNaN(n))return s;if(Math.abs(n)>=3600)return Math.floor(n/3600)+'시간 '+Math.floor((Math.abs(n)%3600)/60)+'분';if(Math.abs(n)>=60)return Math.floor(n/60)+'분 '+Math.round(n%60)+'초';return Math.round(n*10)/10+'초';}
+function fmtPdt(e){
+  if(!e.pdt||e.pdt==='-')return{html:'-',sort:0};
+  var d=new Date(e.pdt);var kst=new Date(d.getTime()+9*3600000);
+  var t=('0'+kst.getUTCHours()).slice(-2)+':'+('0'+kst.getUTCMinutes()).slice(-2)+':'+('0'+kst.getUTCSeconds()).slice(-2);
+  if(e.tm_accuracy!=null){var a=e.tm_accuracy;var c=Math.abs(a)<=5?'#4ade80':Math.abs(a)<=30?'#facc15':'#f87171';return{html:'<span title="UTC:'+e.pdt+'">'+t+'</span> <span style="color:'+c+';font-size:.8em">오차 '+fmtSec(a)+'</span>',sort:e.pdt_diff||0};}
+  if(e.live_latency!=null){var c2=e.live_latency<=10?'#4ade80':e.live_latency<=30?'#facc15':'#f87171';return{html:'<span title="UTC:'+e.pdt+'">'+t+'</span> <span style="color:'+c2+';font-size:.8em">지연 '+fmtSec(e.live_latency)+'</span>',sort:e.pdt_diff||0};}
+  return{html:t,sort:e.pdt_diff||0};
+}
+function renderRows(entries){
+  let h='';entries.forEach(e=>{const cc=cacheClass(e.cf_cache);
+    h+='<tr><td>'+e.ts+'</td><td>'+e.name+'</td><td class="url-cell" title="'+e.url+'">'+e.url+'</td>';
+    h+='<td>'+e.status+'</td>';
+    var am=e.actual_ms!=null?e.actual_ms+'ms':'-';
+    var oh=e.overhead_ms!=null?'<span style="color:#64748b">+'+e.overhead_ms+'ms</span>':'-';
+    h+='<td style="color:#4ade80">'+am+'</td><td>'+oh+'</td><td>'+(e.size||'-')+'</td>';
+    h+='<td class="'+(cc||'')+'">'+e.cf_cache+'</td><td>'+e.cf_pop+'</td>';
+    var pdt=fmtPdt(e);
+    h+='<td>'+pdt.html+'</td>';
+    h+='<td>'+e.cache_control+'</td></tr>';
+  });body.innerHTML=h||'<tr><td colspan="11" style="color:#64748b;text-align:center">요청 데이터 없음</td></tr>';
+}
+function updateSortUI(){
+  document.querySelectorAll('th[data-col]').forEach(th=>{
+    const arrow=th.querySelector('.sort-arrow');
+    if(th.dataset.col===sortCol){th.classList.add('sort-active');arrow.textContent=sortDir==='asc'?' ▲':' ▼';}
+    else{th.classList.remove('sort-active');arrow.textContent='';}
+  });
+}
+function load(){
+  let f=filterType.value,t=filterText.value,cf=filterCache.value,filter=f;if(t)filter=filter?filter+' '+t:t;
+  fetch('/request-log?page='+page+'&per_page='+perPage.value+'&filter='+encodeURIComponent(filter)+'&cache_filter='+encodeURIComponent(cf))
+    .then(r=>r.json()).then(d=>{
+      totalPages=d.total_pages;page=d.page;
+      pageInfo.textContent='Page '+d.page+' / '+d.total_pages;
+      totalInfo.textContent=d.total.toLocaleString()+' requests';
+      prevBtn.disabled=page<=1;nextBtn.disabled=page>=totalPages;
+      lastData=d.entries;
+      renderRows(sortData(lastData));
+    }).catch(()=>{});
+}
+document.querySelectorAll('th[data-col]').forEach(th=>{
+  th.onclick=()=>{
+    const col=th.dataset.col;
+    if(sortCol===col){sortDir=sortDir==='asc'?'desc':'asc';}else{sortCol=col;sortDir='asc';}
+    updateSortUI();renderRows(sortData(lastData));
+  };
+});
+prevBtn.onclick=()=>{if(page>1){page--;load();}};nextBtn.onclick=()=>{if(page<totalPages){page++;load();}};
+filterType.onchange=()=>{page=1;load();};filterCache.onchange=()=>{page=1;load();};filterText.oninput=()=>{page=1;load();};perPage.onchange=()=>{page=1;load();};
+document.getElementById('refreshBtn').onclick=load;
+document.getElementById('exportBtn').onclick=function(){
+  let f=filterType.value,t=filterText.value,cf=filterCache.value,filter=f;if(t)filter=filter?filter+' '+t:t;
+  window.location.href='/request-log-export?filter='+encodeURIComponent(filter)+'&cache_filter='+encodeURIComponent(cf);
+};
+load();
+let timer=setInterval(()=>{load();},3000);
+autoCheck.onchange=()=>{if(autoCheck.checked)timer=setInterval(()=>{load();},3000);else clearInterval(timer);};
+document.addEventListener('click',e=>{if(e.target.classList.contains('url-cell')){
+  navigator.clipboard.writeText(e.target.title).then(()=>{e.target.style.color='#4ade80';setTimeout(()=>{e.target.style.color='';},500);});}});
+</script></body></html>

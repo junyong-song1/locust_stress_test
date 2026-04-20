@@ -1,0 +1,173 @@
+
+<script>
+(function(){
+  var PANEL_HTML=`
+    <style>
+      #rp-panel{background:#f5f5f5;border:1px solid #e0e0e0;border-radius:8px;padding:16px 20px;margin:16px auto;max-width:540px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;}
+      #rp-panel h3{margin:0 0 12px;font-size:14px;color:#333;font-weight:600;}
+      #rp-panel .rp-row{display:flex;align-items:center;gap:10px;margin:8px 0;}
+      #rp-panel .rp-label{min-width:90px;font-size:13px;color:#555;}
+      #rp-panel input[type=range]{flex:1;height:4px;accent-color:#4caf50;}
+      #rp-panel .rp-val{font-weight:700;min-width:24px;text-align:center;font-size:14px;color:#333;}
+      #rp-panel .rp-info{text-align:center;font-size:12px;color:#777;margin:8px 0;}
+      #rp-panel .rp-info b{color:#333;}
+      #rp-panel .rp-bar{display:flex;height:6px;border-radius:3px;overflow:hidden;margin:4px 0 10px;}
+      #rp-panel .rp-bar .b1{background:#4caf50;transition:width .3s;} .rp-bar .b2{background:#ff9800;transition:width .3s;}
+      #rp-panel .rp-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+      #rp-panel .rp-btn{padding:6px 16px;background:#4caf50;color:#fff;border:none;border-radius:4px;font-weight:600;font-size:12px;cursor:pointer;}
+      #rp-panel .rp-btn:hover{background:#43a047;} #rp-panel .rp-btn:disabled{background:#ccc;cursor:not-allowed;}
+      #rp-panel .rp-msg{font-size:11px;color:#4caf50;} #rp-panel .rp-msg.err{color:#f44336;}
+      #rp-panel .rp-link{font-size:11px;margin-left:auto;} #rp-panel .rp-link a{color:#1976d2;text-decoration:none;}
+      #rp-panel .phase-btns{display:flex;gap:6px;margin:10px 0 4px;}
+      #rp-panel .phase-btn{padding:5px 14px;border:2px solid #ccc;border-radius:4px;background:#fff;color:#333;font-weight:600;font-size:12px;cursor:pointer;}
+      #rp-panel .phase-btn:hover{border-color:#4caf50;background:#e8f5e9;}
+      #rp-panel .phase-btn.active{border-color:#4caf50;background:#4caf50;color:#fff;}
+    </style>
+    <h3>페이즈 프리셋 / 사용자 비율</h3>
+    <div class="phase-btns">
+      <button type="button" class="phase-btn" data-live="0" data-tm="10">P1 TM 단독</button>
+      <button type="button" class="phase-btn" data-live="8" data-tm="2">P2 라이브 8:TM 2</button>
+      <button type="button" class="phase-btn" data-live="10" data-tm="0">P3 라이브 단독</button>
+    </div>
+    <div class="rp-row"><span class="rp-label">라이브</span><input type="range" id="rp-live" min="0" max="10" value="5"><span class="rp-val" id="rp-lv">5</span></div>
+    <div class="rp-row"><span class="rp-label">타임머신</span><input type="range" id="rp-tm" min="0" max="10" value="5"><span class="rp-val" id="rp-tv">5</span></div>
+    <div class="rp-info"><b id="rp-lp">50</b>% live / <b id="rp-tp">50</b>% timemachine</div>
+    <div class="rp-bar"><div class="b1" id="rp-b1" style="width:50%"></div><div class="b2" id="rp-b2" style="width:50%"></div></div>
+    <div style="margin:10px 0 4px;border-top:1px solid #e0e0e0;padding-top:10px">
+      <div style="font-size:12px;color:#555;font-weight:600;margin-bottom:6px">타임딜레이 범위 (초) — 최대 10,800 (3시간)</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="number" id="rp-td-min" min="1" max="10800" value="1" style="width:80px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:13px">
+        <span style="color:#999">~</span>
+        <input type="number" id="rp-td-max" min="1" max="10800" value="10800" style="width:80px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:13px">
+        <span style="font-size:11px;color:#999" id="rp-td-info">= 1500 캐시키</span>
+      </div>
+    </div>
+    <div style="margin:10px 0 4px;border-top:1px solid #e0e0e0;padding-top:10px">
+      <div style="font-size:12px;color:#555;font-weight:600;margin-bottom:6px">스트림 URL 설정</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">Host</span>
+          <input type="text" id="rp-host" placeholder="https://your-host.com" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">Path</span>
+          <input type="text" id="rp-stream-path" placeholder="/out/v1/channel/vc12" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">HostHdr</span>
+          <input type="text" id="rp-host-header" placeholder="aws-kbo-smart-cloudfront.tving.com (빈칸이면 미사용)" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">Token</span>
+          <input type="text" id="rp-token" placeholder="JWT 토큰 (빈칸이면 토큰 없이 요청)" style="flex:1;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace">
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:#999;min-width:40px">TM</span>
+          <select id="rp-tm-mode" style="padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:12px">
+            <option value="minus">minus=N (sogne)</option>
+            <option value="aws">aws.manifestsettings (MediaPackage)</option>
+          </select>
+        </div>
+        <div style="font-size:11px;color:#999" id="rp-url-preview">전체 URL: -</div>
+      </div>
+    </div>
+    <div style="margin:10px 0 4px;border-top:1px solid #e0e0e0;padding-top:10px">
+      <div style="font-size:12px;color:#555;font-weight:600;margin-bottom:6px">Ramp-up 계산기</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="number" id="rp-calc-users" min="1" value="1000" style="width:80px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:13px" placeholder="사용자수">
+        <span style="font-size:12px;color:#999">명을</span>
+        <input type="number" id="rp-calc-time" min="1" value="1" style="width:50px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:13px">
+        <select id="rp-calc-unit" style="padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:12px"><option value="min">분</option><option value="sec">초</option></select>
+        <span style="font-size:12px;color:#999">동안 =</span>
+        <span style="font-size:13px;font-weight:700;color:#333" id="rp-calc-result">17/s</span>
+      </div>
+      <div style="font-size:11px;color:#999;margin-top:4px" id="rp-calc-hint">→ 사용자수: 1000 / Ramp up: 17</div>
+    </div>
+    <div class="rp-actions">
+      <button type="button" class="rp-btn" id="rp-apply">적용</button>
+      <span class="rp-msg" id="rp-msg"></span>
+      <span class="rp-link"><a href="/cache-dashboard" target="_blank">캐시 대시보드</a> | <a href="/request-log-view" target="_blank">요청 로그</a></span>
+    </div>
+  `;
+  function removePanel(){var el=document.getElementById('rp-panel');if(el)el.remove();}
+  function initSliders(){
+    var ls=document.getElementById('rp-live'),ts=document.getElementById('rp-tm');if(!ls)return;
+    var lv=document.getElementById('rp-lv'),tv=document.getElementById('rp-tv');
+    var lp=document.getElementById('rp-lp'),tp=document.getElementById('rp-tp');
+    var b1=document.getElementById('rp-b1'),b2=document.getElementById('rp-b2');
+    var btn=document.getElementById('rp-apply'),msg=document.getElementById('rp-msg');
+    function upd(){var a=+ls.value,b=+ts.value;lv.textContent=a;tv.textContent=b;var t=a+b||1,p=Math.round(a/t*100);lp.textContent=p;tp.textContent=100-p;b1.style.width=p+'%';b2.style.width=(100-p)+'%';
+      document.querySelectorAll('#rp-panel .phase-btn').forEach(function(pb){pb.classList.toggle('active',+pb.dataset.live===a&&+pb.dataset.tm===b);});
+    }
+    ls.oninput=upd;ts.oninput=upd;
+    var tdMin=document.getElementById('rp-td-min'),tdMax=document.getElementById('rp-td-max'),tdInfo=document.getElementById('rp-td-info');
+    function updTd(){var mn=+tdMin.value,mx=+tdMax.value;var keys=(mx-mn+1)*15;tdInfo.textContent='= '+keys+' 캐시키';}
+    tdMin.oninput=updTd;tdMax.oninput=updTd;
+    var calcUsers=document.getElementById('rp-calc-users'),calcTime=document.getElementById('rp-calc-time'),calcUnit=document.getElementById('rp-calc-unit'),calcResult=document.getElementById('rp-calc-result'),calcHint=document.getElementById('rp-calc-hint');
+    function getLocustInputs(){var inputs=document.querySelectorAll('input[name]');var u=null,r=null;inputs.forEach(function(el){if(el.name==='userCount')u=el;if(el.name==='spawnRate')r=el;});return{users:u,rate:r};}
+    function setNativeValue(el,val){var nativeSetter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;nativeSetter.call(el,val);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}
+    function updCalc(){var u=+calcUsers.value,t=+calcTime.value,sec=calcUnit.value==='min'?t*60:t;var rate=Math.max(1,Math.ceil(u/sec));calcResult.textContent=rate+'/초';calcHint.textContent='→ 사용자수: '+u+'명 / Ramp up: '+rate+' ('+sec+'초)';}
+    function syncCalcToLocust(){var u=+calcUsers.value,t=+calcTime.value,sec=calcUnit.value==='min'?t*60:t;var rate=Math.max(1,Math.ceil(u/sec));var li=getLocustInputs();if(li.users)setNativeValue(li.users,u);if(li.rate)setNativeValue(li.rate,rate);}
+    function syncLocustToCalc(){var li=getLocustInputs();if(li.users&&li.rate){calcUsers.value=li.users.value;var rate=+li.rate.value;if(rate>0){var u=+li.users.value;var sec=Math.max(1,Math.ceil(u/rate));if(sec>=60&&sec%60===0){calcTime.value=sec/60;calcUnit.value='min';}else{calcTime.value=sec;calcUnit.value='sec';}updCalc();}}}
+    calcUsers.oninput=updCalc;calcTime.oninput=updCalc;calcUnit.onchange=updCalc;
+    setInterval(function(){var li=getLocustInputs();if(li.users){li.users.addEventListener('change',syncLocustToCalc);li.users.addEventListener('input',syncLocustToCalc);li.rate.addEventListener('change',syncLocustToCalc);li.rate.addEventListener('input',syncLocustToCalc);}},2000);
+    var hostInput=document.getElementById('rp-host'),pathInput=document.getElementById('rp-stream-path'),urlPreview=document.getElementById('rp-url-preview');
+    var tokenInput=document.getElementById('rp-token'),tmModeSelect=document.getElementById('rp-tm-mode');
+    var hostHeaderInput=document.getElementById('rp-host-header');
+    function updUrlPreview(){var h=hostInput.value.replace(/\/+$/,''),p=pathInput.value;if(p&&!p.startsWith('/'))p='/'+p;var qs=[];if(tokenInput.value)qs.push('token=***');var mode=tmModeSelect.value;qs.push(mode==='minus'?'minus={N}':'aws.manifestsettings=time_delay:{N}');urlPreview.textContent='Live: '+(h||'(host)')+p+'/playlist_3.m3u8?'+qs[0]+' | TM: +'+qs[1];urlPreview.style.color=h?'#4caf50':'#999';}
+    hostInput.oninput=updUrlPreview;pathInput.oninput=updUrlPreview;tokenInput.oninput=updUrlPreview;tmModeSelect.onchange=updUrlPreview;
+    fetch('/weight-config').then(function(r){return r.json()}).then(function(d){ls.value=d.live_weight;ts.value=d.timemachine_weight;tdMin.value=d.time_delay_min||1;tdMax.value=d.time_delay_max||60;if(d.base_url){try{var u=new URL(d.base_url);hostInput.value=u.origin;pathInput.value=u.pathname;}catch(e){}}if(d.auth_token)tokenInput.value=d.auth_token;if(d.tm_param_mode)tmModeSelect.value=d.tm_param_mode;if(hostHeaderInput)hostHeaderInput.value=d.host_header||'';upd();updTd();updUrlPreview();syncLocustToCalc();}).catch(function(){});
+    // Phase preset buttons
+    document.querySelectorAll('#rp-panel .phase-btn').forEach(function(pb){
+      pb.onclick=function(){ls.value=pb.dataset.live;ts.value=pb.dataset.tm;upd();};
+    });
+    btn.onclick=function(){btn.disabled=true;msg.className='rp-msg';msg.textContent='적용중...';
+      syncCalcToLocust();
+      var payload={live_weight:+ls.value,timemachine_weight:+ts.value,time_delay_min:+tdMin.value,time_delay_max:+tdMax.value};
+      if(hostInput.value.trim())payload.host=hostInput.value.trim().replace(/\/+$/,'');
+      if(pathInput.value.trim())payload.stream_path=pathInput.value.trim();
+      payload.auth_token=tokenInput.value.trim();
+      payload.tm_param_mode=tmModeSelect.value;
+      if(hostHeaderInput)payload.host_header=hostHeaderInput.value.trim();
+      fetch('/weight-config',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(payload)
+      }).then(function(r){return r.json()}).then(function(d){msg.className='rp-msg';
+        var urlMsg=d.url_changed?' | URL 변경됨':'';
+        msg.textContent='완료! L:'+d.live_weight+' T:'+d.timemachine_weight+' 딜레이:'+d.time_delay_min+'~'+d.time_delay_max+'초'+urlMsg;
+        if(d.base_url){var u=new URL(d.base_url);hostInput.value=u.origin;pathInput.value=u.pathname;updUrlPreview();}
+        setTimeout(function(){msg.textContent='';},5000);
+      }).catch(function(){msg.className='rp-msg err';msg.textContent='실패';}).finally(function(){btn.disabled=false;});
+    };
+  }
+  function findStartForm(){var btns=document.querySelectorAll('button[type="submit"]');for(var i=0;i<btns.length;i++){if(btns[i].textContent.trim().toUpperCase()==='START')return btns[i];}return null;}
+  function syncPanel(){var startBtn=findStartForm();if(startBtn){if(!document.getElementById('rp-panel')){var panel=document.createElement('div');panel.id='rp-panel';panel.innerHTML=PANEL_HTML;startBtn.parentElement.insertBefore(panel,startBtn);initSliders();}}else{removePanel();}}
+  var _syncing=false,_timer=null;
+  function startObserver(){syncPanel();new MutationObserver(function(){if(_syncing)return;if(_timer)clearTimeout(_timer);_timer=setTimeout(function(){_syncing=true;try{syncPanel();}finally{_syncing=false;}},300);}).observe(document.getElementById('root'),{childList:true,subtree:true});}
+  // --- Inject extra tabs into Locust top nav bar ---
+  function injectNavTabs(){
+    var navBars=document.querySelectorAll('div.MuiTabs-flexContainer, nav a, [role="tablist"]');
+    // Find the actual tab container (Locust uses MUI Tabs)
+    var tabContainer=document.querySelector('.MuiTabs-flexContainer');
+    if(!tabContainer||document.getElementById('nav-cache-dash'))return;
+    var style=window.getComputedStyle(tabContainer.children[0]);
+    var baseClass=tabContainer.children[0]?tabContainer.children[0].className:'';
+    function makeTab(id,label,href){
+      var a=document.createElement('a');
+      a.id=id;a.href=href;a.target='_blank';a.textContent=label;
+      a.className=baseClass;
+      a.style.cssText='color:#a4abaf;text-decoration:none;padding:6px 12px;font-size:13px;font-weight:400;text-transform:uppercase;min-width:auto;letter-spacing:0.02em;display:inline-flex;align-items:center;cursor:pointer;opacity:0.7;border:1px solid #444;border-radius:4px;margin-left:4px;';
+      a.onmouseenter=function(){a.style.opacity='1';a.style.color='#fff';};
+      a.onmouseleave=function(){a.style.opacity='0.7';a.style.color='#a4abaf';};
+      return a;
+    }
+    tabContainer.appendChild(makeTab('nav-cache-dash','캐시 대시보드','/cache-dashboard'));
+    tabContainer.appendChild(makeTab('nav-req-log','요청 로그','/request-log-view'));
+  }
+  function startNavObserver(){
+    injectNavTabs();
+    new MutationObserver(function(){injectNavTabs();}).observe(document.getElementById('root'),{childList:true,subtree:true});
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){startObserver();startNavObserver();},500);});
+  else setTimeout(function(){startObserver();startNavObserver();},500);
+})();
+</script>

@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CloudFront 캐시 대시보드</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:10px;max-width:100%;margin:0 auto;min-height:100vh}
+  .top-nav{display:flex;gap:0;margin-bottom:16px;background:#1e293b;border-radius:8px;overflow:hidden;border:1px solid #334155}
+  .top-nav a{color:#94a3b8;text-decoration:none;padding:10px 20px;font-size:.85rem;font-weight:600;transition:all .2s;border-right:1px solid #334155}
+  .top-nav a:last-child{border-right:none}
+  .top-nav a:hover{color:#e2e8f0;background:#334155}
+  .top-nav a.active{color:#38bdf8;background:#0f172a;border-bottom:2px solid #38bdf8}
+  .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .header h1{font-size:1.3rem;color:#38bdf8;margin:0}
+  .phase-bar{display:flex;gap:6px;align-items:center}
+  .phase-bar .pb{padding:6px 16px;border:2px solid #334155;border-radius:6px;background:#1e293b;color:#94a3b8;font-weight:600;cursor:pointer;font-size:.8rem}
+  .phase-bar .pb:hover{border-color:#38bdf8;color:#e2e8f0}
+  .phase-bar .pb.active{border-color:#4ade80;background:#166534;color:#4ade80}
+  .phase-info{color:#64748b;font-size:.75rem}
+  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px}
+  .card{background:#1e293b;border-radius:8px;padding:14px;text-align:center}
+  .card .label{color:#64748b;font-size:.7rem;margin-bottom:2px;text-transform:uppercase;letter-spacing:.5px}
+  .card .value{font-size:1.6rem;font-weight:700}
+  .card .sub{color:#64748b;font-size:.7rem;margin-top:2px}
+  .hit{color:#4ade80} .miss{color:#f87171}
+  .rate{font-weight:700} .rate.high{color:#4ade80} .rate.mid{color:#facc15} .rate.low{color:#f87171}
+  .tabs{display:flex;gap:0;margin-bottom:8px;border-bottom:2px solid #1e293b}
+  .tabs button{background:none;border:none;color:#64748b;padding:8px 20px;font-size:.85rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px}
+  .tabs button:hover{color:#e2e8f0}
+  .tabs button.active{color:#38bdf8;border-bottom-color:#38bdf8}
+  .tab-content{display:none} .tab-content.active{display:block}
+  .section{background:#1e293b;border-radius:8px;padding:14px;margin-bottom:12px}
+  .section h2{font-size:.9rem;color:#94a3b8;margin:0 0 10px}
+  table{width:100%;border-collapse:collapse;font-size:.8rem}
+  th{text-align:left;padding:6px 10px;border-bottom:2px solid #334155;color:#64748b;font-weight:600;font-size:.75rem;text-transform:uppercase}
+  td{padding:6px 10px;border-bottom:1px solid #0f172a}
+  tr:hover td{background:#334155}
+  .chart-full{background:#1e293b;border-radius:8px;padding:12px;margin-bottom:12px}
+  .chart-full h3{font-size:.85rem;margin-bottom:6px;color:#94a3b8}
+  .chart-full canvas{width:100%;height:200px}
+  .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+  .chart-box{background:#1e293b;border-radius:8px;padding:12px}
+  .chart-box h3{font-size:.85rem;margin-bottom:6px;color:#94a3b8}
+  .chart-box canvas{width:100%;height:200px}
+  .latency-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+  .lat-box{background:#1e293b;border-radius:8px;padding:14px}
+  .lat-box h3{font-size:.85rem;margin-bottom:8px}
+  .lat-row{display:flex;justify-content:space-between;padding:3px 0;font-size:.8rem}
+  .lat-val{font-weight:700}
+  .verdict-pass{color:#4ade80;font-weight:700} .verdict-fail{color:#f87171;font-weight:700} .verdict-warn{color:#facc15;font-weight:700}
+  .no-data{color:#475569;font-size:.85rem;padding:20px;text-align:center}
+  .dl-btn{position:absolute;top:8px;right:8px;background:#334155;color:#94a3b8;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.7rem;opacity:.5;transition:opacity .2s}
+  .dl-btn:hover{opacity:1;color:#e2e8f0}
+  .chart-full,.chart-box{position:relative}
+  .dl-bar{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+  .dl-bar button{background:#334155;color:#e2e8f0;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:.8rem}
+  .dl-bar button:hover{background:#475569}
+  .live-bar{background:linear-gradient(135deg,#1a1a2e,#16213e);border:1px solid #0f3460;border-radius:8px;padding:12px 16px;margin-bottom:12px;position:relative;overflow:hidden}
+  .live-bar::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#f87171,#fb923c,#facc15,#4ade80);animation:livePulse 2s ease-in-out infinite}
+  @keyframes livePulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .live-bar .lb-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+  .live-bar .lb-dot{width:8px;height:8px;border-radius:50%;background:#f87171;animation:blink 1s infinite}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+  .live-bar .lb-title{font-size:.75rem;color:#f87171;font-weight:700;text-transform:uppercase;letter-spacing:1px}
+  .live-bar .lb-ts{font-size:.7rem;color:#475569;margin-left:auto}
+  .live-bar .lb-metrics{display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+  .live-bar .lb-item{display:flex;flex-direction:column;align-items:center;min-width:70px}
+  .live-bar .lb-val{font-size:1.1rem;font-weight:700;color:#e2e8f0}
+  .live-bar .lb-label{font-size:.65rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px}
+  .live-bar .lb-sep{width:1px;height:28px;background:#334155}
+  .live-bar .lb-detail{font-size:.72rem;color:#64748b;margin-top:6px;padding-top:6px;border-top:1px solid #1e293b}
+  .live-bar .lb-detail b{color:#94a3b8}
+  .live-bar .lb-nodata{color:#475569;font-size:.8rem;text-align:center;padding:4px 0}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+</head>
+<body>
+<nav class="top-nav">
+  <a href="/">Locust UI</a>
+  <a href="/cache-dashboard" class="active">캐시 대시보드</a>
+  <a href="/request-log-view">요청 로그</a>
+</nav>
+
+<div class="live-bar" id="liveBar">
+  <div class="lb-header">
+    <span class="lb-dot"></span>
+    <span class="lb-title">실시간 (10초)</span>
+    <span class="lb-ts" id="lbTs">-</span>
+  </div>
+  <div id="lbContent"><div class="lb-nodata">데이터 수집중...</div></div>
+</div>
+
+<div class="header">
+  <h1>캐시 대시보드 <span style="font-size:.7rem;color:#475569;font-weight:400">▲ 실시간 (10초) &nbsp; ▼ 누적 (전체)</span></h1>
+  <div class="phase-bar">
+    <button class="pb" onclick="setPhase('P1')">P1 TM Only</button>
+    <button class="pb" onclick="setPhase('P2')">P2 Mixed</button>
+    <button class="pb" onclick="setPhase('P3')">P3 Live</button>
+    <span class="phase-info" id="phaseInfo">-</span>
+  </div>
+</div>
+
+<div class="cards" id="topCards"></div>
+
+<div class="tabs">
+  <button class="active" onclick="switchTab('charts',this)">차트</button>
+  <button onclick="switchTab('latency',this)">응답속도 & 판정</button>
+  <button onclick="switchTab('breakdown',this)">상세분류</button>
+</div>
+
+<div id="tab-charts" class="tab-content active">
+  <div class="chart-full"><button class="dl-btn" onclick="downloadChartPng('c1','전체RPS')">PNG</button><h3>1. 전체 RPS <small style="font-weight:400;color:#94a3b8">— 초당 처리 요청수. 실측 vs 목표(CCU÷사이클) 비교</small> <span id="c1info" style="font-size:.75rem;font-weight:400"></span></h3><div style="height:200px"><canvas id="c1"></canvas></div></div>
+  <div class="chart-grid">
+    <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c2','히트율')">PNG</button><h3>2. 캐시 히트율 / 미스율 <small style="font-weight:400;color:#94a3b8">— CF 캐시 효율. 95%↑ PASS, 80%↓ FAIL</small></h3><div style="height:200px"><canvas id="c2"></canvas></div></div>
+    <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c3','호출수')">PNG</button><h3>3. 구간별 호출수 <small style="font-weight:400;color:#94a3b8">— CF MISS + 오리진 도달 호출 건수. MISS와 오리진이 비례하면 캐시 미스가 곧 오리진 부하</small></h3><div style="height:200px"><canvas id="c3"></canvas></div></div>
+    <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c4','응답속도')">PNG</button><h3>4. HIT / MISS 응답속도 <small style="font-weight:400;color:#94a3b8">— HIT≤100ms PASS, MISS≤500ms PASS</small></h3><div style="height:200px"><canvas id="c4"></canvas></div></div>
+    <div class="chart-box"><button class="dl-btn" onclick="downloadChartPng('c5','에러율')">PNG</button><h3>5. 에러율 <small style="font-weight:400;color:#94a3b8">— 0.1%↓ PASS, 1%↑ FAIL. 4xx/5xx 모니터링</small></h3><div style="height:200px"><canvas id="c5"></canvas></div></div>
+  </div>
+  <div class="chart-full"><button class="dl-btn" onclick="downloadChartPng('c8m','Master응답분포1초')">PNG</button><h3>6. Master m3u8 응답시간 분포 (1초 버킷) <small style="font-weight:400;color:#94a3b8">— master playlist 응답속도별 요청 건수</small></h3><div style="height:260px"><canvas id="c8m"></canvas></div></div>
+  <div class="chart-full"><button class="dl-btn" onclick="downloadChartPng('c8c','Child응답분포1초')">PNG</button><h3>7. Child m3u8 응답시간 분포 (1초 버킷) <small style="font-weight:400;color:#94a3b8">— rendition playlist 응답속도별 요청 건수</small></h3><div style="height:260px"><canvas id="c8c"></canvas></div></div>
+</div>
+<div id="tab-latency" class="tab-content"></div>
+<div id="tab-breakdown" class="tab-content"></div>
+
+<div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+  <button type="button" onclick="downloadFullScreenshot()" style="background:#2563eb;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:.8rem;font-weight:600">전체 스크린샷 PNG</button>
+
+  <button type="button" onclick="downloadSnapshot()" style="background:#334155;color:#e2e8f0;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:.8rem">데이터 JSON</button>
+  <select id="prevResults" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:5px 10px;border-radius:4px;font-size:.8rem"><option value="">-- 이전 결과 --</option></select>
+  <button type="button" onclick="downloadPrev()" style="background:#334155;color:#e2e8f0;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:.8rem">다운로드</button>
+  <span style="color:#334155;font-size:.7rem">자동 새로고침 3초</span>
+</div>
+
+<script>
+function downloadChartPng(canvasId,filename){
+  var chart=chartInstances[canvasId];if(!chart)return;
+  var a=document.createElement('a');a.href=chart.toBase64Image('image/png',1.0);a.download=(filename||canvasId)+'_'+new Date().toISOString().slice(0,19).replace(/[:.]/g,'-')+'.png';a.click();
+}
+function downloadFullScreenshot(){
+  var btn=event.target;btn.textContent='캡처중...';btn.disabled=true;
+  html2canvas(document.body,{backgroundColor:'#0f172a',scale:2,useCORS:true,logging:false,windowWidth:1400}).then(function(canvas){
+    var a=document.createElement('a');a.href=canvas.toDataURL('image/png');a.download='cache_dashboard_'+new Date().toISOString().slice(0,19).replace(/[:.]/g,'-')+'.png';a.click();
+  }).finally(function(){btn.textContent='전체 스크린샷 PNG';btn.disabled=false;});
+}
+
+function switchTab(id,btn){
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+id).classList.add('active');
+  btn.classList.add('active');
+}
+function setPhase(p){
+  var pr={P1:{live:0,tm:10},P2:{live:8,tm:2},P3:{live:10,tm:0}}[p];if(!pr)return;
+  fetch('/weight-config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({live_weight:pr.live,timemachine_weight:pr.tm,phase:p})
+  }).then(r=>r.json()).then(()=>refresh()).catch(()=>{});
+}
+function rc(r){return r>=95?'high':r>=80?'mid':'low';}
+function vc(v){return v==='PASS'?'verdict-pass':v==='FAIL'?'verdict-fail':'verdict-warn';}
+var chartInstances={};
+var _schema=null;
+var chartDarkTheme={grid:{color:'#1e293b'},ticks:{color:'#64748b',font:{size:10}}};
+function syncCrosshair(chartId){
+  return {id:'syncCrosshair',afterEvent:function(chart,args){
+    if(args.event.type==='mousemove'||args.event.type==='mouseout'){
+      Object.keys(chartInstances).forEach(function(k){
+        if(k===chartId)return;var c=chartInstances[k];if(!c)return;
+        if(args.event.type==='mouseout'){c.setActiveElements([]);c.tooltip.setActiveElements([],{x:0,y:0});c.update('none');return;}
+        var elements=[];c.data.datasets.forEach(function(ds,di){
+          var meta=c.getDatasetMeta(di);if(!meta.hidden){var idx=chart.tooltip&&chart.tooltip.dataPoints?chart.tooltip.dataPoints[0].dataIndex:0;
+            if(meta.data[idx])elements.push({datasetIndex:di,index:idx});}});
+        if(elements.length){c.setActiveElements(elements);c.tooltip.setActiveElements(elements,{x:c.getDatasetMeta(0).data[elements[0].index].x,y:0});c.update('none');}
+      });
+    }
+  }};
+}
+function makeChart(canvasId,cfg){
+  var el=document.getElementById(canvasId);if(!el)return;
+  if(chartInstances[canvasId]){
+    // Update existing chart data in-place (no flicker)
+    var chart=chartInstances[canvasId];
+    chart.data.labels=cfg.data.labels;
+    cfg.data.datasets.forEach(function(ds,i){
+      if(chart.data.datasets[i]){chart.data.datasets[i].data=ds.data;}
+    });
+    chart.update('none');
+    return;
+  }
+  cfg.options=cfg.options||{};cfg.options.responsive=true;cfg.options.maintainAspectRatio=false;
+  cfg.options.interaction={mode:'index',intersect:false};
+  cfg.options.plugins=cfg.options.plugins||{};
+  cfg.options.plugins.tooltip={mode:'index',intersect:false,backgroundColor:'#1e293b',titleColor:'#e2e8f0',bodyColor:'#e2e8f0',borderColor:'#334155',borderWidth:1,padding:8,bodySpacing:4};
+  cfg.options.plugins.legend={display:true,labels:{color:'#94a3b8',boxWidth:10,padding:8,font:{size:11}}};
+  cfg.plugins=[syncCrosshair(canvasId)];
+  cfg.options.animation={duration:0};
+  chartInstances[canvasId]=new Chart(el,cfg);
+}
+function renderLiveBar(rt){
+  var el=document.getElementById('lbContent');
+  if(!rt||!rt.ts){el.innerHTML='<div class="lb-nodata">데이터 수집중...</div>';return;}
+  document.getElementById('lbTs').textContent=rt.ts+' 기준';
+  var h='<div class="lb-metrics">';
+  var rpsColor=rt.target_rps>0?(rt.rps>=rt.target_rps*0.9?'#4ade80':rt.rps>=rt.target_rps*0.7?'#facc15':'#f87171'):'#38bdf8';
+  var rpsPct=rt.target_rps>0?Math.round(rt.rps/rt.target_rps*100):'-';
+  h+='<div class="lb-item"><span class="lb-val" style="color:'+rpsColor+'">'+rt.rps+'</span><span class="lb-label">RPS (목표 '+rt.target_rps+')</span></div>';
+  h+='<div class="lb-item"><span class="lb-val" style="color:'+rpsColor+'">'+rpsPct+'%</span><span class="lb-label">RPS 달성률</span></div>';
+  h+='<span class="lb-sep"></span>';
+  h+='<div class="lb-item"><span class="lb-val" style="color:#4ade80">'+rt.hit_rps+'</span><span class="lb-label">CF HIT (캐시응답)/초</span></div>';
+  h+='<div class="lb-item"><span class="lb-val" style="color:#f87171">'+rt.miss_rps+'</span><span class="lb-label">CF MISS (오리진행)/초</span></div>';
+  h+='<span class="lb-sep"></span>';
+  var hrc=rt.hit_rate>=80?'#4ade80':rt.hit_rate>=50?'#facc15':'#f87171';
+  h+='<div class="lb-item"><span class="lb-val" style="color:'+hrc+'">'+rt.hit_rate+'%</span><span class="lb-label">히트율</span></div>';
+  h+='<span class="lb-sep"></span>';
+  var cfa=rt.cf_actual||{};var cfHit=cfa.hit_ms||0;var cfMiss=cfa.miss_ms||0;
+  var hitDelay=rt.hit_avg_ms>0&&cfHit>0?Math.round(rt.hit_avg_ms-cfHit):0;
+  var missDelay=rt.miss_avg_ms>0&&cfMiss>0?Math.round(rt.miss_avg_ms-cfMiss):0;
+  h+='<div class="lb-item"><span class="lb-val" style="color:#4ade80">'+cfHit+'ms</span><span class="lb-sub" style="color:#64748b;font-size:.7rem"> +'+Math.max(0,hitDelay)+'ms</span><span class="lb-label">HIT CF응답 <small>+지연</small></span></div>';
+  h+='<div class="lb-item"><span class="lb-val" style="color:#f87171">'+cfMiss+'ms</span><span class="lb-sub" style="color:#64748b;font-size:.7rem"> +'+Math.max(0,missDelay)+'ms</span><span class="lb-label">MISS CF응답 <small>+지연</small></span></div>';
+  h+='<span class="lb-sep"></span>';
+  var erc=rt.error_rate<=0.1?'#4ade80':rt.error_rate<=1.0?'#facc15':'#f87171';
+  h+='<div class="lb-item"><span class="lb-val" style="color:'+erc+'">'+rt.error_rate+'%</span><span class="lb-label">에러율</span></div>';
+  h+='<span class="lb-sep"></span>';
+  // Mbps removed — playlist-only traffic is misleading
+  h+='</div>';
+  h+='<div class="lb-detail">RPS 상세: <b>'+(rt.total_requests||0).toLocaleString()+'</b>건 / <b>'+rt.interval_sec+'</b>초 = <b>'+(rt.rps||0).toLocaleString()+'/s</b> &nbsp;( HIT <b>'+(rt.hits||0).toLocaleString()+'</b>건 = <b>'+(rt.hit_rps||0).toLocaleString()+'/s</b> + MISS <b>'+(rt.misses||0).toLocaleString()+'</b>건 = <b>'+(rt.miss_rps||0).toLocaleString()+'/s</b>';
+  if(rt.errors>0)h+=' + 에러 <b>'+rt.errors+'</b>건';
+  h+=' ) &nbsp;│&nbsp; 목표 RPS 계산: <b>'+(rt.user_count||0)+'</b>명 ÷ <b>'+(rt.avg_cycle_sec||'?')+'</b>초(사이클) = <b>'+rt.target_rps+'/s</b></div>';
+  el.innerHTML=h;
+}
+function refresh(){
+  fetch('/dashboard-bundle?n=1800').then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(d=>{
+    var cache=d.cache,lat=d.latency,pf=d.pass_fail,wc=d.weight,origin=d.origin,mts=d.metrics_ts,rt=d.realtime;
+    renderLiveBar(rt);
+    var o=cache.overall;
+    // Phase
+    document.getElementById('phaseInfo').textContent=(wc.phase||'-')+' L:'+wc.live_weight+' T:'+wc.timemachine_weight;
+    document.querySelectorAll('.phase-bar .pb').forEach(b=>b.classList.toggle('active',b.textContent.includes(wc.phase||'---')));
+    // Top cards
+    var cards='';
+    cards+='<div class="card"><div class="label">히트율</div><div class="value rate '+rc(o.hit_rate)+'">'+o.hit_rate+'%</div><div class="sub">'+(o.hits||0).toLocaleString()+' / '+(o.total||0).toLocaleString()+'</div></div>';
+    var cfA=rt&&rt.cf_actual?rt.cf_actual:{};var cfH=cfA.hit_ms||'-';var cfM=cfA.miss_ms||'-';
+    cards+='<div class="card"><div class="label">응답속도</div><div class="value" style="font-size:1.1rem"><span class="hit">'+cfH+'</span> / <span class="miss">'+cfM+'</span></div><div class="sub">CF실제 HIT / MISS ms</div></div>';
+    cards+='<div class="card"><div class="label">총 요청수</div><div class="value" style="font-size:1.2rem">'+(o.total||0).toLocaleString()+'</div><div class="sub">평균 수명: '+o.avg_age+'초 | POP: '+o.top_pop+'</div></div>';
+    cards+='<div class="card"><div class="label">오리진 / 에러</div><div class="value" style="font-size:1.1rem"><span style="color:'+(origin.current_origin_rps<5?'#4ade80':'#f87171')+'">'+origin.current_origin_rps+'/s</span> <span style="color:'+(lat.error_rate<0.1?'#4ade80':'#f87171')+'">'+lat.error_rate+'%</span></div><div class="sub">오리진 요청/초 | 에러율</div></div>';
+    document.getElementById('topCards').innerHTML=cards;
+
+    // Tab: Charts — update data in-place (no flicker)
+    if(!mts||mts.length===0){
+      // No data — destroy existing charts
+      ['c1','c2','c3','c4','c5','c8m','c8c'].forEach(function(id){if(chartInstances[id]){chartInstances[id].destroy();delete chartInstances[id];}});
+      var c1info=document.getElementById('c1info');if(c1info)c1info.innerHTML='<span style="color:#475569">데이터 수집중...</span>';
+    }
+    if(mts&&mts.length>0){
+      var lastPt=mts[mts.length-1];
+      var c1info=document.getElementById('c1info');
+      if(c1info&&lastPt){var pct=lastPt.target_rps>0?Math.round(lastPt.total_rps/lastPt.target_rps*100):'-';var pctColor=pct>=90?'#4ade80':pct>=70?'#facc15':'#f87171';
+        var cycSec=lastPt.user_count>0&&lastPt.target_rps>0?(lastPt.user_count/lastPt.target_rps).toFixed(1):'?';
+        c1info.innerHTML='<span style="color:#64748b">실측 '+lastPt.total_rps+'/s</span> <span style="color:#64748b">│ 목표 '+lastPt.target_rps+'/s ('+lastPt.user_count+'명 ÷ '+cycSec+'초)</span> <span style="color:'+pctColor+';font-weight:700">│ 달성률 '+pct+'%</span>';}
+      var tsL=mts.map(p=>p.ts);
+      var missRps=mts.map(p=>Math.max(0,p.total_rps-p.total_rps*(p.hit_rate/100)));
+      makeChart('c1',{type:'line',data:{labels:tsL,datasets:[
+        {label:'전체 RPS',data:mts.map(p=>p.total_rps),borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3},
+        {label:'목표 RPS',data:mts.map(p=>p.target_rps||0),borderColor:'#facc15',borderDash:[6,3],borderWidth:1.5,pointRadius:0,tension:0.3}
+      ]},options:{scales:{x:chartDarkTheme,y:{...chartDarkTheme,beginAtZero:true,title:{display:true,text:'RPS',color:'#64748b'}}}}});
+      makeChart('c2',{type:'line',data:{labels:tsL,datasets:[
+        {label:'히트율 %',data:mts.map(p=>p.hit_rate),borderColor:'#4ade80',backgroundColor:'rgba(74,222,128,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
+        {label:'미스율 %',data:mts.map(p=>Math.max(0,100-p.hit_rate)),borderColor:'#f87171',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0.3,yAxisID:'y1'},
+        {label:'목표 95%',data:mts.map(()=>95),borderColor:'#facc15',borderDash:[6,3],borderWidth:1,pointRadius:0,yAxisID:'y'}
+      ]},options:{scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',min:0,max:100,title:{display:true,text:'히트율 %',color:'#4ade80'}},y1:{...chartDarkTheme,position:'right',min:0,title:{display:true,text:'미스율 %',color:'#f87171'},grid:{drawOnChartArea:false}}}}});
+      var fmtNum=function(v){return v.toLocaleString();};
+      makeChart('c3',{type:'line',data:{labels:tsL,datasets:[
+        {label:'CF MISS 호출수 (구간)',data:mts.map(p=>p.miss_count||0),borderColor:'#fb923c',backgroundColor:'rgba(251,146,60,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
+        {label:'오리진 도달 RPS (/s)',data:mts.map(p=>p.origin_rps||0),borderColor:'#f87171',borderDash:[4,4],borderWidth:1.5,pointRadius:0,tension:0.3,yAxisID:'y1'}
+      ]},options:{plugins:{tooltip:{mode:'index',intersect:false,callbacks:{label:function(ctx){var v=ctx.parsed.y;var unit=ctx.datasetIndex===0?'건':'/s';return ctx.dataset.label+': '+v.toLocaleString()+unit;}}},legend:{labels:{color:'#94a3b8',boxWidth:10,padding:8}}},scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',beginAtZero:true,title:{display:true,text:'CF MISS 호출수 (건/구간)',color:'#fb923c'},ticks:{callback:fmtNum}},y1:{...chartDarkTheme,position:'right',beginAtZero:true,title:{display:true,text:'오리진 도달 RPS (/s)',color:'#f87171'},ticks:{callback:fmtNum},grid:{drawOnChartArea:false}}}}});
+      makeChart('c4',{type:'line',data:{labels:tsL,datasets:[
+        {label:'CF HIT',data:mts.map(p=>p.cf_hit_ms||0),borderColor:'#4ade80',borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y'},
+        {label:'CF MISS',data:mts.map(p=>p.cf_miss_ms||0),borderColor:'#f87171',borderWidth:2,pointRadius:0,tension:0.3,yAxisID:'y1'},
+        {label:'Locust HIT',data:mts.map(p=>p.hit_avg),borderColor:'#4ade80',borderDash:[4,4],borderWidth:1,pointRadius:0,tension:0.3,yAxisID:'y'},
+        {label:'Locust MISS',data:mts.map(p=>p.miss_avg),borderColor:'#f87171',borderDash:[4,4],borderWidth:1,pointRadius:0,tension:0.3,yAxisID:'y1'}
+      ]},options:{scales:{x:chartDarkTheme,y:{...chartDarkTheme,position:'left',beginAtZero:true,title:{display:true,text:'HIT ms',color:'#4ade80'}},y1:{...chartDarkTheme,position:'right',beginAtZero:true,title:{display:true,text:'MISS ms',color:'#f87171'},grid:{drawOnChartArea:false}}}}});
+      makeChart('c5',{type:'line',data:{labels:tsL,datasets:[
+        {label:'에러율 %',data:mts.map(p=>p.error_rate||0),borderColor:'#facc15',backgroundColor:'rgba(250,204,21,0.08)',fill:true,borderWidth:2,pointRadius:0,tension:0.3},
+        {label:'경고선 0.1%',data:mts.map(()=>0.1),borderColor:'#fb923c',borderDash:[6,3],borderWidth:1,pointRadius:0},
+        {label:'위험선 1.0%',data:mts.map(()=>1.0),borderColor:'#f87171',borderDash:[6,3],borderWidth:1,pointRadius:0}
+      ]},options:{scales:{x:chartDarkTheme,y:{...chartDarkTheme,beginAtZero:true,title:{display:true,text:'에러율 %',color:'#facc15'}}}}});
+    }
+    // master/child m3u8 1초버킷 막대차트 (ok/error 스택)
+    var renderSecHist=function(canvasId,hist,barColor){
+      if(!hist||!hist.labels||!hist.labels.length){if(chartInstances[canvasId]){chartInstances[canvasId].destroy();delete chartInstances[canvasId];}return;}
+      makeChart(canvasId,{type:'bar',data:{labels:hist.labels,datasets:[
+        {label:'성공',data:hist.ok||[],backgroundColor:barColor||'rgba(56,189,248,0.80)',borderColor:'#38bdf8',borderWidth:1,stack:'s'},
+        {label:'에러',data:hist.error||[],backgroundColor:'rgba(248,113,113,0.75)',borderColor:'#f87171',borderWidth:1,stack:'s'}
+      ]},options:{
+        plugins:{
+          tooltip:{mode:'index',intersect:false,callbacks:{label:function(ctx){return ctx.dataset.label+': '+(ctx.parsed.y||0).toLocaleString()+'건';},footer:function(items){var t=0;items.forEach(function(it){t+=(it.parsed.y||0);});return '합계: '+t.toLocaleString()+'건';}}},
+          legend:{display:true,labels:{color:'#94a3b8',boxWidth:10,padding:8,font:{size:11}}}
+        },
+        scales:{
+          x:{...chartDarkTheme,title:{display:true,text:'응답시간 버킷',color:'#94a3b8'}},
+          y:{...chartDarkTheme,beginAtZero:true,stacked:true,title:{display:true,text:'요청 건수',color:'#94a3b8'},ticks:{callback:function(v){return v.toLocaleString();}}}
+        }
+      }});
+    };
+    renderSecHist('c8m', d.master_sec_hist, 'rgba(250,204,21,0.80)');
+    renderSecHist('c8c', d.child_sec_hist,  'rgba(56,189,248,0.80)');
+
+    // Tab: Latency & Judgment
+    var lt='';
+    // Master/Child m3u8 percentile summary (SSAI 핵심 KPI)
+    var ml=d.master_latency||{},cl=d.child_latency||{};
+    var ppc=function(v,p,f){if(v<=0)return '';return v<=p?'color:#4ade80':(v>f?'color:#f87171':'color:#facc15');};
+    lt+='<div class="section"><h2>M3U8 응답속도 백분위 (SSAI 핵심 KPI)</h2><table><tr><th>레이어</th><th>샘플수</th><th>p50</th><th>p95</th><th>p99</th><th>avg</th><th>max</th><th>에러율</th></tr>';
+    [['Master',ml],['Child',cl]].forEach(function(pair){
+      var nm=pair[0],s=pair[1]||{};
+      lt+='<tr><td><b>'+nm+' m3u8</b></td><td>'+(s.count||0).toLocaleString()+'</td>'
+        +'<td style="'+ppc(s.p50||0,150,500)+'">'+(s.p50||0)+' ms</td>'
+        +'<td style="'+ppc(s.p95||0,400,1000)+'">'+(s.p95||0)+' ms</td>'
+        +'<td style="'+ppc(s.p99||0,800,2000)+'">'+(s.p99||0)+' ms</td>'
+        +'<td>'+(s.avg||0)+' ms</td><td>'+(s.max||0)+' ms</td>'
+        +'<td>'+(s.error_rate||0)+'%</td></tr>';
+    });
+    lt+='</table></div>';
+    lt+='<div class="latency-grid">';
+    var cfA2=rt&&rt.cf_actual?rt.cf_actual:{};
+    lt+='<div class="lat-box"><h3 class="hit">HIT 응답속도</h3>';
+    lt+='<div class="lat-row"><span>CF 실제</span><span class="lat-val" style="color:#4ade80;font-size:1.1rem">'+(cfA2.hit_ms||'-')+' ms</span></div>';
+    lt+='<div class="lat-row"><span>Locust 평균 <small style="color:#64748b">(+지연)</small></span><span class="lat-val" style="color:#64748b">'+lat.hit.avg+' ms</span></div>';
+    lt+='<div class="lat-row"><span>건수</span><span class="lat-val">'+lat.hit.count+'</span></div></div>';
+    lt+='<div class="lat-box"><h3 class="miss">MISS 응답속도</h3>';
+    lt+='<div class="lat-row"><span>CF 실제</span><span class="lat-val" style="color:#f87171;font-size:1.1rem">'+(cfA2.miss_ms||'-')+' ms</span></div>';
+    lt+='<div class="lat-row"><span>Locust 평균 <small style="color:#64748b">(+지연)</small></span><span class="lat-val" style="color:#64748b">'+lat.miss.avg+' ms</span></div>';
+    lt+='<div class="lat-row"><span>건수</span><span class="lat-val">'+lat.miss.count+'</span></div></div>';
+    lt+='</div>';
+    lt+='<div class="section"><h2>합격 / 불합격 판정</h2><table><tr><th>항목</th><th>측정값</th><th>합격기준</th><th>불합격기준</th><th>결과</th></tr>';
+    pf.forEach(r=>{lt+='<tr><td>'+r.label+'</td><td><b>'+r.value+'</b></td><td>'+r.pass+'</td><td>'+r.fail+'</td><td class="'+vc(r.verdict)+'">'+r.verdict+'</td></tr>';});
+    lt+='</table></div>';
+    lt+='<div id="extra-metrics"></div>';
+    document.getElementById('tab-latency').innerHTML=lt;
+    if(_schema)renderExtraMetrics(_schema,d.metrics_flat||{});
+
+    // Tab: Breakdown
+    var bk='';
+    if(lat.by_codec&&Object.keys(lat.by_codec).length){
+      bk+='<div class="section"><h2>코덱별</h2><table><tr><th>코덱</th><th>총건수</th><th>히트율</th><th>HIT 평균</th><th>MISS 평균</th></tr>';
+      for(var c in lat.by_codec){var d=lat.by_codec[c];bk+='<tr><td><b>'+c+'</b></td><td>'+d.total.toLocaleString()+'</td><td class="rate '+rc(d.hit_rate)+'">'+d.hit_rate+'%</td><td>'+d.hit.avg+' ms</td><td>'+d.miss.avg+' ms</td></tr>';}
+      bk+='</table></div>';
+    }
+    if(lat.by_rendition&&Object.keys(lat.by_rendition).length){
+      bk+='<div class="section"><h2>렌디션별</h2><table><tr><th>렌디션</th><th>총건수</th><th>히트율</th><th>HIT 평균</th><th>MISS 평균</th></tr>';
+      for(var r in lat.by_rendition){var d=lat.by_rendition[r];bk+='<tr><td><b>'+r+'</b></td><td>'+d.total.toLocaleString()+'</td><td class="rate '+rc(d.hit_rate)+'">'+d.hit_rate+'%</td><td>'+d.hit.avg+' ms</td><td>'+d.miss.avg+' ms</td></tr>';}
+      bk+='</table></div>';
+    }
+    if(cache.by_user_type&&cache.by_user_type.length){
+      bk+='<div class="section"><h2>사용자유형별</h2><table><tr><th>유형</th><th>총건수</th><th>히트</th><th>미스</th><th>히트율</th><th>평균 수명</th></tr>';
+      cache.by_user_type.forEach(r=>{bk+='<tr><td><b>'+r.user_type+'</b></td><td>'+r.total.toLocaleString()+'</td><td class="hit">'+r.hits.toLocaleString()+'</td><td class="miss">'+r.misses.toLocaleString()+'</td><td class="rate '+rc(r.hit_rate)+'">'+r.hit_rate+'%</td><td>'+r.avg_age+'s</td></tr>';});
+      bk+='</table></div>';
+    }
+    if(!bk)bk='<div class="no-data">데이터 없음</div>';
+    document.getElementById('tab-breakdown').innerHTML=bk;
+  }).catch(e=>{
+    console.warn('[dashboard] bundle failed, trying individual fetches:',e);
+    Promise.all([
+      fetch('/cache-stats').then(r=>r.json()),
+      fetch('/latency-stats').then(r=>r.json()),
+      fetch('/pass-fail').then(r=>r.json()),
+      fetch('/weight-config').then(r=>r.json()),
+      fetch('/origin-rps').then(r=>r.json()),
+      fetch('/metrics-ts?n=1800').then(r=>r.json()),
+      fetch('/realtime-stats').then(r=>r.json()),
+    ]).then(function([cache,lat,pf,wc,origin,mts,rt]){
+      renderLiveBar(rt);
+      var o=cache.overall;
+      document.getElementById('phaseInfo').textContent=(wc.phase||'-')+' L:'+wc.live_weight+' T:'+wc.timemachine_weight;
+      document.querySelectorAll('.phase-bar .pb').forEach(b=>b.classList.toggle('active',b.textContent.includes(wc.phase||'---')));
+      var cards='';
+      cards+='<div class="card"><div class="label">히트율</div><div class="value rate '+rc(o.hit_rate)+'">'+o.hit_rate+'%</div><div class="sub">'+(o.hits||0).toLocaleString()+' / '+(o.total||0).toLocaleString()+'</div></div>';
+      var cfA=rt&&rt.cf_actual?rt.cf_actual:{};var cfH=cfA.hit_ms||'-';var cfM=cfA.miss_ms||'-';
+      cards+='<div class="card"><div class="label">응답속도</div><div class="value" style="font-size:1.1rem"><span class="hit">'+cfH+'</span> / <span class="miss">'+cfM+'</span></div><div class="sub">CF실제 HIT / MISS ms</div></div>';
+      cards+='<div class="card"><div class="label">총 요청수</div><div class="value" style="font-size:1.2rem">'+(o.total||0).toLocaleString()+'</div><div class="sub">평균 수명: '+o.avg_age+'초 | POP: '+o.top_pop+'</div></div>';
+      cards+='<div class="card"><div class="label">오리진 / 에러</div><div class="value" style="font-size:1.1rem"><span style="color:'+(origin.current_origin_rps<5?'#4ade80':'#f87171')+'">'+origin.current_origin_rps+'/s</span> <span style="color:'+(lat.error_rate<0.1?'#4ade80':'#f87171')+'">'+lat.error_rate+'%</span></div><div class="sub">오리진 요청/초 | 에러율</div></div>';
+      document.getElementById('topCards').innerHTML=cards;
+    }).catch(e2=>{console.error('[dashboard] fallback also failed:',e2);});
+  });
+}
+function renderExtraMetrics(schema,data){
+  var builtins={cache:1,latency:1,m3u8:1,realtime:1,system:1,general:1};
+  var extras=schema.filter(function(m){return !builtins[m.group];});
+  var container=document.getElementById('extra-metrics');
+  if(!container)return;
+  if(!extras.length){container.innerHTML='';return;}
+  var h='<div class="section" style="margin-top:12px"><h2>추가 메트릭</h2><table><tr><th>메트릭</th><th>현재값</th><th>합격기준</th><th>불합격기준</th><th>결과</th></tr>';
+  extras.forEach(function(m){
+    var val=data[m.key];
+    var valStr=val!==null&&val!==undefined?val+m.unit:'N/A';
+    var verdict='WARN';
+    if(val!==null&&val!==undefined&&m.pass_val!==null){
+      if(m.higher_is_better){verdict=val>=m.pass_val?'PASS':(val<m.fail_val?'FAIL':'WARN');}
+      else{verdict=val<=m.pass_val?'PASS':(val>m.fail_val?'FAIL':'WARN');}
+    }
+    var passStr=m.pass_val!==null?(m.higher_is_better?'>=':'<=')+m.pass_val:'-';
+    var failStr=m.fail_val!==null?(m.higher_is_better?'<':'>')+m.fail_val:'-';
+    h+='<tr><td>'+m.label+'</td><td><b>'+valStr+'</b></td><td>'+passStr+'</td><td>'+failStr+'</td><td class="'+vc(verdict)+'">'+verdict+'</td></tr>';
+  });
+  h+='</table></div>';
+  container.innerHTML=h;
+}
+function downloadSnapshot(){
+  fetch('/dashboard-bundle?n=1800').then(r=>r.json()).then(d=>{
+    var cache=d.cache,lat=d.latency,pf=d.pass_fail,origin=d.origin,wc=d.weight,mts=d.metrics_ts;
+    var snap={meta:{phase:wc.phase,live:wc.live_weight,tm:wc.timemachine_weight,time:new Date().toISOString()},cache:cache,latency:lat,pass_fail:pf,origin:origin,timeseries:mts};
+    var blob=new Blob([JSON.stringify(snap,null,2)],{type:'application/json'});
+    var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='snapshot_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';a.click();
+  });
+}
+function downloadPrev(){var s=document.getElementById('prevResults');if(s.value)window.open('/results/'+s.value);}
+fetch('/results').then(r=>r.json()).then(files=>{
+  var sel=document.getElementById('prevResults');
+  files.forEach(f=>{var o=document.createElement('option');o.value=f;o.textContent=f;sel.appendChild(o);});
+});
+fetch('/metrics-schema').then(function(r){return r.json();}).then(function(s){_schema=s;}).catch(function(){});
+refresh();setInterval(refresh,3000);
+</script>
+</body></html>
